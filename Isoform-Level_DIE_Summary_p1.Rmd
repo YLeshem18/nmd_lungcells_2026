@@ -1,0 +1,826 @@
+---
+title: "Isoform-Level DIE Summary: NMD Inhibition Effects (Part 1)"
+author: "Leshem, Yul"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: lumen
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+---
+
+Code location: `/udd/reyle/nmd_lungcells_2026/code/final/die_mashr_summary_part1_2026.3.10.Rmd`
+
+
+
+```{r setup, include=FALSE}
+options(bitmapType = "cairo")
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      cache = FALSE, dev = "png")
+
+```
+
+# Analysis Overview
+
+This report summarizes Differential Isoform Expression (DIE) results from the
+NMD inhibition study, using mashr posterior estimates.
+
+Effect sizes (`logFC`) are posterior means from multivariate adaptive shrinkage,
+which borrows strength across cell types. Significance is the local false sign
+rate (lfsr); lfsr < 0.05 means there is < 5% probability that the sign of the
+effect estimate is wrong. lfsr is carried in the `adj.P.Val` column for
+column-format compatibility with limma topTables.
+
+**Experimental Design:**
+
+- **Treatment:** Smg1i (NMD inhibitor) vs DMSO (control)
+- **Cell Types:** AT2, LAE, FB, MV (DD_ALI / DO_ALI excluded — donor confounding / small n)
+- **Data Type:** Long-read PacBio Kinnex/MAS-Seq, SQANTI3-filtered isoforms
+- **Analysis:** limma-voom + mashr at transcript level
+
+**Definitions:**
+
+- **NMD susceptible transcript:** posterior mean logFC > 0 AND lfsr < 0.05
+  (rises when NMD is inhibited).
+- **NMD suppressed transcript:** posterior mean logFC < 0 AND lfsr < 0.05.
+
+# Libraries
+
+```{r load-libs}
+library(tidyverse)
+library(data.table)
+library(DT)
+library(edgeR)
+library(pheatmap)
+
+# Bioconductor namespace masking guard
+rename <- dplyr::rename
+select <- dplyr::select
+filter <- dplyr::filter
+mutate <- dplyr::mutate
+count  <- dplyr::count
+```
+
+```{r configuration}
+DATE_STAMP <- "2026.3.10"
+
+INPUT_DIE_DIR <- "/udd/reyle/nmd_lungcells_2026/long_read/mashr"
+OUTPUT_DIR    <- file.path("/udd/reyle/nmd_lungcells_2026/tmp/mashr_die")
+OUT_DIR_FIG   <- "/udd/reyle/nmd_lungcells_2026/final_figures/lr_iso"
+
+dir.create(OUTPUT_DIR,  recursive = TRUE, showWarnings = FALSE)
+dir.create(OUT_DIR_FIG, recursive = TRUE, showWarnings = FALSE)
+
+# 4 cell types only — DD_ALI / DO_ALI dropped upstream.
+# Pipeline now writes nmd_mashr_die_at2/lae/fb/mv_<date>.csv, so the keys here
+# are the lower-case file codes (at2/lae/fb/mv), mapped to display names.
+CELLTYPE_MAP     <- c("at2" = "AT2", "lae" = "LAE", "fb" = "FB", "mv" = "MV")
+CT_DISPLAY_ORDER <- c("AT2", "LAE", "FB", "MV")
+
+SIGNIFICANCE_THRESHOLD <- 0.05
+LOGFC_THRESHOLD        <- 0
+TOP_HITS_N             <- 50
+
+cat("Input DIE directory:", INPUT_DIE_DIR, "\n")
+cat("Output directory:",     OUTPUT_DIR,    "\n\n")
+
+```
+
+# Load DIE Results
+
+```{r load-die}
+# File pattern: nmd_mashr_die_<ct>_<date>.csv
+# Splitting by underscore: parts[1]="nmd", [2]="mashr", [3]="die",
+# [4]=<ct>, [5]="<date>.csv"  -> cell type lives at parts[4]
+die_files <- list.files(
+  INPUT_DIE_DIR,
+  pattern = paste0("^nmd_mashr_die_.*_", gsub("\\.", "\\\\.", DATE_STAMP), "\\.csv$"),
+  full.names = TRUE
+)
+
+cat("Found", length(die_files), "DIE files:\n")
+print(basename(die_files))
+
+# Original transcript counts per file (before any filtering in this report)
+original_counts <- map_df(die_files, ~{
+  parts        <- str_split(basename(.x), "_")[[1]]
+  celltype     <- parts[4]
+  n_transcripts <- nrow(fread(.x, select = 1L, header = TRUE))
+  tibble(cell_type_file = celltype,
+         cell_type      = CELLTYPE_MAP[celltype],
+         original_count = n_transcripts)
+})
+
+cat("Transcripts loaded per cell type (before report-level filtering):\n")
+print(original_counts %>% select(cell_type_file, cell_type, original_count))
+
+all_dge <- map_df(die_files, ~{
+  df    <- read_csv(.x, show_col_types = FALSE)
+  parts <- str_split(basename(.x), "_")[[1]]
+  df$cell_type_file <- parts[4]
+  df
+})
+
+all_dge$cell_type <- CELLTYPE_MAP[all_dge$cell_type_file]
+
+# FILTER: drop rows whose file code is not in CELLTYPE_MAP. This is the
+# load-bearing sanity check — if CELLTYPE_MAP does not match the filenames
+# (e.g. stale at/dd keys), every row maps to NA and the report empties out.
+n_before <- nrow(all_dge)
+all_dge  <- all_dge %>% filter(!is.na(cell_type))
+cat(sprintf(
+  "FILTER: dropped %d row(s) with an unmapped cell-type code (check CELLTYPE_MAP vs filenames).\n  Rows before: %d / Rows now: %d.\n",
+  n_before - nrow(all_dge), n_before, nrow(all_dge)))
+stopifnot(nrow(all_dge) > 0)
+
+# Standardize columns
+cat("Columns present in DIE files:\n  ", paste(colnames(all_dge), collapse = ", "), "\n")
+
+if ("txid" %in% colnames(all_dge) && !"transcript_id" %in% colnames(all_dge)) {
+  colnames(all_dge)[colnames(all_dge) == "txid"] <- "transcript_id"
+}
+
+# Gene-id column may be written under several names by the pipeline. Resolve it
+# to a canonical `gene_id`, failing loudly if none is found (a silent NULL
+# assignment would leave gene_group_id missing and break the overlap chunks).
+gene_id_candidates <- c("gene_id", "gene_group_id", "gene", "ensembl_gene_id",
+                        "geneid", "ensembl_gene_id_version")
+gid <- intersect(gene_id_candidates, colnames(all_dge))
+if (length(gid) == 0) {
+  stop("No gene-id column found in DIE files. Columns are: ",
+       paste(colnames(all_dge), collapse = ", "))
+}
+if (!"gene_id" %in% colnames(all_dge)) {
+  all_dge$gene_id <- all_dge[[gid[1]]]
+  cat("Using '", gid[1], "' as gene_id.\n", sep = "")
+}
+
+if ("hgnc_symbol" %in% colnames(all_dge)) {
+  all_dge <- all_dge %>%
+    mutate(gene_symbol = ifelse(!is.na(hgnc_symbol) & hgnc_symbol != "",
+                                hgnc_symbol, gene_id))
+} else if (!"gene_symbol" %in% colnames(all_dge)) {
+  all_dge$gene_symbol <- all_dge$gene_id
+}
+if (!"gene_group_id" %in% colnames(all_dge)) {
+  all_dge$gene_group_id <- all_dge$gene_id
+}
+
+cat("Combined DIE data:", nrow(all_dge), "rows,",
+    length(unique(all_dge$cell_type)), "cell types\n")
+cat("Cell types present:", paste(sort(unique(all_dge$cell_type)), collapse = ", "), "\n")
+cat("Example transcript IDs:\n  ",
+    paste(head(unique(all_dge$transcript_id), 3), collapse = ", "), "\n")
+
+n_with_symbol <- sum(!is.na(all_dge$gene_symbol) &
+                     all_dge$gene_symbol != "" &
+                     !grepl("^ENSG", all_dge$gene_symbol))
+cat("Gene symbol coverage:", n_with_symbol, "/", nrow(all_dge),
+    "(", round(100 * n_with_symbol / nrow(all_dge), 1), "%)\n")
+```
+
+# Summary Statistics
+
+```{r summary-stats}
+# Column definitions (first use):
+cat("Table 1 column definitions:\n")
+cat("  total_transcripts   = isoforms tested in this cell type (mashr output).\n")
+cat("  sig_transcripts     = isoforms with lfsr < 0.05.\n")
+cat("  nmd_susceptible     = significant isoforms with logFC > 0 (Smg1i-up; NMD susceptible).\n")
+cat("  nmd_suppressed      = significant isoforms with logFC < 0.\n")
+cat("  pct_sig             = sig_transcripts as % of total tested.\n")
+cat("  pct_nmd_susceptible = NMD susceptible as % of significant.\n\n")
+
+die_summary <- all_dge %>%
+  group_by(cell_type) %>%
+  summarize(
+    sig_transcripts  = sum(adj.P.Val < SIGNIFICANCE_THRESHOLD, na.rm = TRUE),
+    nmd_susceptible  = sum(adj.P.Val < SIGNIFICANCE_THRESHOLD &
+                           logFC     > LOGFC_THRESHOLD, na.rm = TRUE),
+    nmd_suppressed   = sum(adj.P.Val < SIGNIFICANCE_THRESHOLD &
+                           logFC    < -LOGFC_THRESHOLD, na.rm = TRUE),
+    mean_logFC_nmd   = mean(logFC[adj.P.Val < SIGNIFICANCE_THRESHOLD &
+                                  logFC > LOGFC_THRESHOLD], na.rm = TRUE),
+    median_logFC_nmd = median(logFC[adj.P.Val < SIGNIFICANCE_THRESHOLD &
+                                    logFC > LOGFC_THRESHOLD], na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(original_counts %>% select(cell_type, original_count), by = "cell_type") %>%
+  rename(total_transcripts = original_count) %>%
+  mutate(
+    pct_sig             = round(100 * sig_transcripts / total_transcripts, 2),
+    pct_nmd_susceptible = round(100 * nmd_susceptible  / sig_transcripts,   2)
+  ) %>%
+  select(cell_type, total_transcripts, sig_transcripts, nmd_susceptible, nmd_suppressed,
+         pct_sig, pct_nmd_susceptible, mean_logFC_nmd, median_logFC_nmd)
+
+knitr::kable(die_summary, digits = 2,
+             caption = "Table 1. DIE Summary: Significant Transcripts And NMD Susceptible Counts Per Cell Type")
+
+write_tsv(die_summary, file.path(OUTPUT_DIR, paste0("mashr_die_summary_stats_", DATE_STAMP, ".tsv")))
+
+```
+
+## NMD Susceptible Transcripts
+
+```{r nmd-responsive}
+nmd_responsive <- all_dge %>%
+  filter(logFC > LOGFC_THRESHOLD, adj.P.Val < SIGNIFICANCE_THRESHOLD)
+
+cat(sprintf("Of %d tested isoform x cell-type rows, %d are NMD susceptible (logFC > 0 & lfsr < 0.05).\n",
+            nrow(all_dge), nrow(nmd_responsive)))
+cat(sprintf("Unique NMD susceptible transcripts (any cell type): %d.\n",
+            n_distinct(nmd_responsive$transcript_id)))
+
+nmd_summary <- nmd_responsive %>%
+  group_by(cell_type) %>%
+  summarize(
+    n_transcripts = n(),
+    n_genes       = n_distinct(gene_group_id, na.rm = TRUE),
+    mean_logFC    = mean(logFC),
+    median_logFC  = median(logFC),
+    max_logFC     = max(logFC),
+    .groups = "drop"
+  )
+
+knitr::kable(nmd_summary, digits = 2,
+             caption = "Table 2. NMD Susceptible Transcripts By Cell Type")
+
+write_tsv(nmd_responsive, file.path(OUTPUT_DIR, paste0("mashr_die_nmd_responsive_all_", DATE_STAMP, ".tsv")))
+```
+
+## Top Hits Per Cell Type
+
+```{r top-hits, results='asis'}
+table_num <- 3
+
+for (ct in CT_DISPLAY_ORDER) {
+  if (!ct %in% nmd_responsive$cell_type) next
+  cat("\n###", ct, "\n\n")
+
+  available_cols <- intersect(
+    c("transcript_id", "gene_symbol", "gene_id", "logFC", "adj.P.Val", "nmd_responsive"),
+    colnames(nmd_responsive)
+  )
+
+  top_hits <- nmd_responsive %>%
+    filter(cell_type == ct) %>%
+    arrange(adj.P.Val) %>%
+    head(TOP_HITS_N) %>%
+    select(all_of(available_cols))
+
+  print(knitr::kable(
+    top_hits, digits = 4, row.names = FALSE,
+    caption = paste0("Table ", table_num, ". Top ", TOP_HITS_N,
+                     " NMD Susceptible Transcripts In ", ct)
+  ))
+  cat("\n\n")
+  table_num <- table_num + 1
+
+  output_file <- file.path(OUTPUT_DIR,
+                           paste0("mashr_die_top_hits_", tolower(ct), "_", DATE_STAMP, ".tsv"))
+  write_tsv(top_hits, output_file)
+}
+
+```
+
+```{r top10-parallel-with-transcript-name-standalone-fixed}
+# ============================================================
+# STANDALONE: Top 10 NMD susceptible isoforms per cell type
+# Rebuilds nmd_responsive from DIE CSVs, then renders Option-4 table.
+# FIXED: deduplicate gmap lookup; vectorized case_when on scalar inputs.
+# ============================================================
+
+library(tidyverse)
+library(data.table)
+
+# --- Config (match your main report) ---
+DATE_STAMP    <- "2026.3.10"
+INPUT_DIE_DIR <- "/udd/reyle/nmd_lungcells_2026/long_read/mashr"
+OUTPUT_DIR    <- "/udd/reyle/nmd_lungcells_2026/tmp/mashr_die"
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+CELLTYPE_MAP     <- c("at2" = "AT2", "lae" = "LAE", "fb" = "FB", "mv" = "MV")
+CT_DISPLAY_ORDER <- c("AT2", "LAE", "FB", "MV")
+
+SIGNIFICANCE_THRESHOLD <- 0.05
+LOGFC_THRESHOLD        <- 0
+TOP_N                  <- 10
+
+# --- 1. Load DIE results ---
+die_files <- list.files(
+  INPUT_DIE_DIR,
+  pattern = paste0("^nmd_mashr_die_.*_", gsub("\\.", "\\\\.", DATE_STAMP), "\\.csv$"),
+  full.names = TRUE
+)
+
+all_dge <- map_df(die_files, ~{
+  df    <- read_csv(.x, show_col_types = FALSE)
+  parts <- str_split(basename(.x), "_")[[1]]
+  df$cell_type_file <- parts[4]
+  df
+})
+
+all_dge$cell_type <- CELLTYPE_MAP[all_dge$cell_type_file]
+n_before <- nrow(all_dge)
+all_dge  <- all_dge %>% filter(!is.na(cell_type))
+cat(sprintf("FILTER: dropped %d row(s) with an unmapped cell-type code; %d rows retained.\n",
+            n_before - nrow(all_dge), nrow(all_dge)))
+
+if ("txid" %in% colnames(all_dge) && !"transcript_id" %in% colnames(all_dge)) {
+  colnames(all_dge)[colnames(all_dge) == "txid"] <- "transcript_id"
+}
+gene_id_candidates <- c("gene_id", "gene_group_id", "gene", "ensembl_gene_id",
+                        "geneid", "ensembl_gene_id_version")
+gid <- intersect(gene_id_candidates, colnames(all_dge))
+if (length(gid) == 0) {
+  stop("No gene-id column found in DIE files. Columns are: ",
+       paste(colnames(all_dge), collapse = ", "))
+}
+if (!"gene_id" %in% colnames(all_dge)) all_dge$gene_id <- all_dge[[gid[1]]]
+
+if ("hgnc_symbol" %in% colnames(all_dge)) {
+  all_dge <- all_dge %>%
+    mutate(gene_symbol = ifelse(!is.na(hgnc_symbol) & hgnc_symbol != "",
+                                hgnc_symbol, gene_id))
+} else if (!"gene_symbol" %in% colnames(all_dge)) {
+  all_dge$gene_symbol <- all_dge$gene_id
+}
+# Downstream overlap chunks group on gene_group_id, and this chunk overwrites
+# the global nmd_responsive, so create it here too.
+if (!"gene_group_id" %in% colnames(all_dge)) all_dge$gene_group_id <- all_dge$gene_id
+
+nmd_responsive <- all_dge %>%
+  filter(logFC > LOGFC_THRESHOLD, adj.P.Val < SIGNIFICANCE_THRESHOLD)
+
+cat("Loaded", nrow(nmd_responsive), "NMD susceptible isoform-celltype rows\n")
+
+# --- 2. Load gmap and build *deduplicated* lookup ---
+GMAP_PATH <- "/udd/repjc/RESEARCH/REUSABLE_CODE/rds/gmap_txlevel_ENSGv115_2025.08.12.rds"
+gmap <- readRDS(GMAP_PATH)
+
+# Dedupe: one row per key. If multiple transcript_names exist for the same ID,
+# keep the first non-empty one.
+tx_lookup_ver <- gmap %>%
+  as.data.frame() %>%
+  transmute(
+    tx_key          = ensembl_transcript_id_version,
+    transcript_name = external_transcript_name
+  ) %>%
+  filter(!is.na(transcript_name), transcript_name != "",
+         !is.na(tx_key), tx_key != "") %>%
+  distinct(tx_key, .keep_all = TRUE)
+
+tx_lookup_nover <- gmap %>%
+  as.data.frame() %>%
+  transmute(
+    tx_key          = sub("\\.\\d+$", "", ensembl_transcript_id_version),
+    transcript_name = external_transcript_name
+  ) %>%
+  filter(!is.na(transcript_name), transcript_name != "",
+         !is.na(tx_key), tx_key != "") %>%
+  distinct(tx_key, .keep_all = TRUE)
+
+cat("Deduped gmap lookups: ", nrow(tx_lookup_ver), " versioned, ",
+    nrow(tx_lookup_nover), " unversioned\n", sep = "")
+
+# --- 3. Vectorized label builder (rowwise-safe) ---
+make_clean_label <- function(tx_id, gene_symbol, transcript_name) {
+  # Coerce all to character of equal length up front
+  tx_id           <- as.character(tx_id)
+  gene_symbol     <- as.character(gene_symbol)
+  transcript_name <- as.character(transcript_name)
+
+  # Element-wise novel detection
+  novel_match <- regmatches(tx_id, regexpr("\\.novel(\\d+)$", tx_id))
+  is_novel    <- grepl("\\.novel\\d+$", tx_id)
+  novel_num   <- ifelse(is_novel, sub(".*\\.novel(\\d+)$", "\\1", tx_id), NA_character_)
+
+  has_symbol  <- !is.na(gene_symbol) & gene_symbol != "" & !grepl("^ENSG", gene_symbol)
+  has_txname  <- !is.na(transcript_name) & transcript_name != ""
+  bare_ensg   <- sub("\\.\\d+$", "", tx_id)
+
+  dplyr::case_when(
+    is_novel & has_symbol   ~ paste0(gene_symbol, " (novel ", novel_num, ")"),
+    is_novel                ~ paste0(bare_ensg, " (novel ", novel_num, ")"),
+    has_txname              ~ transcript_name,
+    grepl("^ENST", tx_id)   ~ tx_id,
+    has_symbol              ~ gene_symbol,
+    TRUE                    ~ bare_ensg
+  )
+}
+
+# --- 4. Rank, join transcript_name, build display ---
+top10_long <- nmd_responsive %>%
+  group_by(cell_type) %>%
+  arrange(adj.P.Val, desc(logFC), .by_group = TRUE) %>%
+  slice_head(n = TOP_N) %>%
+  ungroup() %>%
+  # First try versioned key
+  left_join(tx_lookup_ver, by = c("transcript_id" = "tx_key")) %>%
+  # Then unversioned (under a different column name so we can coalesce)
+  left_join(tx_lookup_nover %>% rename(transcript_name_nover = transcript_name),
+            by = c("transcript_id" = "tx_key")) %>%
+  mutate(
+    transcript_name = coalesce(transcript_name, transcript_name_nover)
+  ) %>%
+  select(-transcript_name_nover) %>%
+  mutate(
+    label      = make_clean_label(transcript_id, gene_symbol, transcript_name),
+    cell_value = sprintf("%s — %.2f", label, logFC)
+  ) %>%
+  group_by(cell_type) %>%
+  mutate(rank = row_number()) %>%
+  ungroup() %>%
+  select(rank, cell_type, cell_value)
+
+# Sanity: confirm exactly TOP_N rows per cell type
+top10_long %>% count(cell_type) %>% print()
+
+# --- 5. Pivot wide and render ---
+top10_wide <- top10_long %>%
+  pivot_wider(names_from = cell_type, values_from = cell_value) %>%
+  select(rank, all_of(CT_DISPLAY_ORDER))
+
+knitr::kable(
+  top10_wide,
+  col.names = c("Rank", CT_DISPLAY_ORDER),
+  align     = c("c", rep("l", length(CT_DISPLAY_ORDER))),
+  caption   = paste0(
+    "Table 2. Top ", TOP_N, " NMD susceptible isoforms per cell type. ",
+    "Cells show isoform identifier and Smg1i vs DMSO log2 fold change, ",
+    "ranked by lfsr ascending. Novel isoforms denoted \"GENE (novel N)\"; ",
+    "known isoforms shown by Ensembl transcript name (e.g., SRSF2-208)."
+  )
+)
+
+# --- 6. Sanity check: which known ENST IDs failed lookup? ---
+missing_txname <- nmd_responsive %>%
+  group_by(cell_type) %>%
+  arrange(adj.P.Val, desc(logFC), .by_group = TRUE) %>%
+  slice_head(n = TOP_N) %>%
+  ungroup() %>%
+  filter(grepl("^ENST", transcript_id)) %>%
+  left_join(tx_lookup_ver, by = c("transcript_id" = "tx_key")) %>%
+  left_join(tx_lookup_nover %>% rename(transcript_name_nover = transcript_name),
+            by = c("transcript_id" = "tx_key")) %>%
+  mutate(transcript_name = coalesce(transcript_name, transcript_name_nover)) %>%
+  filter(is.na(transcript_name)) %>%
+  select(cell_type, transcript_id, gene_symbol)
+
+if (nrow(missing_txname) > 0) {
+  cat("\nKnown ENST IDs in top 10 with no transcript_name in gmap:\n")
+  print(missing_txname)
+} else {
+  cat("\nAll known ENST IDs in top 10 resolved to transcript_name.\n")
+}
+
+# --- 7. Write TSV ---
+write_tsv(
+  top10_wide,
+  file.path(OUTPUT_DIR, paste0("mashr_die_top10_parallel_option4_", DATE_STAMP, ".tsv"))
+)
+```
+
+# Visualizations
+
+## Volcano Plots
+
+```{r volcano-plots, fig.width=10, fig.height=10}
+volcano_data <- all_dge %>%
+  mutate(
+    neg_log10_lfsr = -log10(adj.P.Val + 1e-300),
+    significance = case_when(
+      logFC > 0 & adj.P.Val < SIGNIFICANCE_THRESHOLD ~ "NMD susceptible",
+      logFC < 0 & adj.P.Val < SIGNIFICANCE_THRESHOLD ~ "NMD suppressed",
+      TRUE                                            ~ "Not significant"
+    )
+  )
+volcano_data$cell_type <- factor(volcano_data$cell_type, levels = CT_DISPLAY_ORDER)
+
+p_volcano <- ggplot(volcano_data,
+                    aes(x = logFC, y = neg_log10_lfsr, color = significance)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  facet_wrap(~ cell_type, ncol = 2) +
+  scale_color_manual(values = c(
+    "NMD susceptible" = "steelblue",
+    "NMD suppressed"  = "coral",
+    "Not significant" = "gray70"
+  )) +
+  coord_cartesian(ylim = c(0, 50)) +
+  geom_hline(yintercept = -log10(SIGNIFICANCE_THRESHOLD), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  labs(
+    title    = "Figure 1: Volcano Plots",
+    subtitle = "Posterior mean logFC vs −log10(lfsr); y-axis capped at 50",
+    x        = "Posterior Mean log2 Fold Change (Smg1i Vs DMSO)",
+    y        = expression(-log[10]("lfsr")),
+    color    = "Status"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top",
+        strip.text      = element_text(face = "bold", size = 13),
+        plot.title      = element_text(size = 14, face = "bold", hjust = 0.5),
+        plot.subtitle   = element_text(color = "grey40", hjust = 0.5))
+
+ggsave(file.path(OUT_DIR_FIG, paste0("volcano_2x2_lr_iso_", DATE_STAMP, ".png")),
+       p_volcano, width = 10, height = 10, dpi = 300, bg = "white")
+
+print(p_volcano)
+
+```
+
+## logFC Distribution
+
+```{r logfc-distribution, fig.width=10, fig.height=6}
+median_logfc <- nmd_responsive %>%
+  group_by(cell_type) %>%
+  summarize(median_logFC = median(logFC), .groups = "drop")
+
+nmd_responsive$cell_type <- factor(nmd_responsive$cell_type, levels = CT_DISPLAY_ORDER)
+median_logfc$cell_type   <- factor(median_logfc$cell_type,   levels = CT_DISPLAY_ORDER)
+
+p_dens <- ggplot(nmd_responsive, aes(x = logFC, fill = cell_type, color = cell_type)) +
+  geom_density(alpha = 0.3, linewidth = 1) +
+  geom_vline(data = median_logfc,
+             aes(xintercept = median_logFC, color = cell_type),
+             linetype = "dashed", linewidth = 0.8) +
+  labs(title    = "Figure 3: logFC Distribution For NMD Susceptible Transcripts",
+       subtitle = "Posterior mean logFC; dashed lines = per-cell-type median",
+       x        = "Posterior Mean log2 Fold Change (Smg1i Vs DMSO)",
+       y        = "Density",
+       fill     = "Cell Type", color = "Cell Type") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top",
+        plot.title      = element_text(face = "bold"),
+        plot.subtitle   = element_text(color = "grey40"))
+
+ggsave(file.path(OUT_DIR_FIG, paste0("logfc_density_lr_iso_", DATE_STAMP, ".png")),
+       p_dens, width = 10, height = 6, dpi = 300, bg = "white")
+
+print(p_dens)
+```
+
+# Isoform-Level Cell-Type Overlap
+
+## Overlap Counts
+
+```{r isoform-overlap}
+cat("Cell-type sharing of NMD susceptible isoforms.\n")
+cat("  n_celltypes = number of cell types in which a transcript is NMD susceptible.\n")
+cat("  core        = NMD susceptible in all 4 cell types; cell-type-specific = exactly 1.\n\n")
+
+transcript_celltype_counts <- nmd_responsive %>%
+  select(cell_type, transcript_id, gene_group_id, gene_symbol) %>%
+  group_by(transcript_id, gene_group_id, gene_symbol) %>%
+  summarize(
+    n_celltypes = n_distinct(cell_type),
+    celltypes   = paste(sort(unique(as.character(cell_type))), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_celltypes), transcript_id)
+
+isoform_overlap_summary <- transcript_celltype_counts %>%
+  count(n_celltypes, name = "n_transcripts") %>%
+  mutate(pct_transcripts = 100 * n_transcripts / sum(n_transcripts))
+
+knitr::kable(isoform_overlap_summary, digits = 1,
+             caption = "Isoform Overlap Summary By Number Of Cell Types")
+
+p_overlap <- ggplot(isoform_overlap_summary,
+                    aes(x = factor(n_celltypes), y = n_transcripts, fill = factor(n_celltypes))) +
+  geom_col() +
+  geom_text(aes(label = n_transcripts), vjust = -0.5, size = 4) +
+  scale_fill_brewer(palette = "Set3") +
+  labs(title = "Figure 4A: NMD Susceptible Transcripts By Cell-Type Consistency",
+       x = "Number Of Cell Types With NMD Response",
+       y = "Number Of Transcripts") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none",
+        plot.title      = element_text(face = "bold"))
+
+ggsave(file.path(OUT_DIR_FIG, paste0("isoform_overlap_lr_iso_", DATE_STAMP, ".png")),
+       p_overlap, width = 8, height = 5, dpi = 300, bg = "white")
+
+print(p_overlap)
+
+write_tsv(transcript_celltype_counts,
+          file.path(OUTPUT_DIR, paste0("mashr_die_transcript_celltype_overlap_", DATE_STAMP, ".tsv")))
+
+```
+
+## Multi-Cell-Type And Core Transcripts
+
+```{r multi-and-core-transcripts}
+multi_celltype_transcripts <- transcript_celltype_counts %>%
+  filter(n_celltypes >= 2) %>%
+  arrange(desc(n_celltypes))
+
+cat("Transcripts present in 2+ cell types:", nrow(multi_celltype_transcripts), "\n")
+
+# "Core" = present in all 4 cell types (was 4 before; matches new design)
+core_transcripts <- transcript_celltype_counts %>%
+  filter(n_celltypes >= 4) %>%
+  arrange(desc(n_celltypes), transcript_id)
+
+cat("Core NMD target transcripts (all 4 cell types):", nrow(core_transcripts), "\n")
+
+if (nrow(core_transcripts) > 0) {
+  knitr::kable(head(core_transcripts, 50),
+               caption = "Core NMD Target Transcripts (Present In All 4 Cell Types)")
+
+  write_tsv(core_transcripts,
+            file.path(OUTPUT_DIR, paste0("mashr_die_core_nmd_transcripts_", DATE_STAMP, ".tsv")))
+
+  detail_cols <- intersect(
+    c("cell_type", "transcript_id", "gene_group_id", "gene_symbol", "logFC", "adj.P.Val"),
+    colnames(nmd_responsive)
+  )
+  core_transcript_details <- nmd_responsive %>%
+    filter(transcript_id %in% core_transcripts$transcript_id) %>%
+    select(all_of(detail_cols)) %>%
+    arrange(transcript_id, cell_type)
+  write_tsv(core_transcript_details,
+            file.path(OUTPUT_DIR, paste0("mashr_die_core_transcript_details_", DATE_STAMP, ".tsv")))
+}
+```
+
+## Cell-Type-Specific Transcripts
+
+```{r celltype-specific-transcripts, results='asis'}
+celltype_specific_transcripts <- transcript_celltype_counts %>%
+  filter(n_celltypes == 1) %>%
+  left_join(nmd_responsive %>% select(transcript_id, cell_type, logFC, adj.P.Val),
+            by = "transcript_id") %>%
+  arrange(cell_type, desc(logFC))
+
+cat("Cell-type-specific transcripts:", nrow(celltype_specific_transcripts), "\n\n")
+
+specific_transcript_summary <- celltype_specific_transcripts %>%
+  group_by(cell_type) %>%
+  summarize(n_transcripts = n(),
+            mean_logFC    = mean(logFC),
+            .groups = "drop")
+
+knitr::kable(specific_transcript_summary, digits = 2,
+             caption = "Cell-Type-Specific NMD Susceptible Transcripts By Cell Type")
+
+for (ct in CT_DISPLAY_ORDER) {
+  ct_specific <- celltype_specific_transcripts %>%
+    filter(cell_type == ct) %>%
+    select(transcript_id, gene_symbol, logFC, adj.P.Val) %>%
+    head(10)
+  if (nrow(ct_specific) > 0) {
+    cat("\n**", ct, "** (",
+        sum(celltype_specific_transcripts$cell_type == ct), " total)\n\n")
+    print(knitr::kable(ct_specific, digits = 4, row.names = FALSE))
+    cat("\n")
+  }
+}
+
+write_tsv(celltype_specific_transcripts,
+          file.path(OUTPUT_DIR, paste0("mashr_die_celltype_specific_transcripts_", DATE_STAMP, ".tsv")))
+
+```
+
+```{r isoform-overlap-interpretation}
+total_transcripts  <- n_distinct(nmd_responsive$transcript_id)
+transcripts_in_all <- sum(transcript_celltype_counts$n_celltypes == length(CT_DISPLAY_ORDER))
+transcripts_in_1   <- sum(transcript_celltype_counts$n_celltypes == 1)
+
+cat("**Summary:**\n")
+cat("- Total unique NMD susceptible transcripts:", total_transcripts, "\n")
+cat("- Transcripts in all 4 cell types:", transcripts_in_all,
+    "(", round(100 * transcripts_in_all / total_transcripts, 1), "%)\n")
+cat("- Transcripts in only 1 cell type:", transcripts_in_1,
+    "(", round(100 * transcripts_in_1 / total_transcripts, 1), "%)\n")
+```
+
+# Gene-Level Cell-Type Overlap
+
+## Overlap Counts
+
+```{r gene-overlap}
+cat("Cell-type sharing of genes with NMD susceptible isoforms.\n")
+cat("  n_celltypes = number of cell types in which a gene has an NMD susceptible isoform.\n")
+cat("  core        = susceptible in all 4 cell types; cell-type-specific = exactly 1.\n\n")
+
+nmd_responsive_genes <- nmd_responsive %>%
+  select(cell_type, gene_group_id, gene_symbol) %>%
+  distinct() %>%
+  filter(!is.na(gene_group_id), gene_group_id != "")
+
+gene_celltype_counts <- nmd_responsive_genes %>%
+  group_by(gene_group_id, gene_symbol) %>%
+  summarize(
+    n_celltypes = n_distinct(cell_type),
+    celltypes   = paste(sort(unique(as.character(cell_type))), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_celltypes), gene_symbol)
+
+overlap_summary <- gene_celltype_counts %>%
+  count(n_celltypes, name = "n_genes") %>%
+  mutate(pct_genes = 100 * n_genes / sum(n_genes))
+
+knitr::kable(overlap_summary, digits = 1, caption = "Gene Overlap Summary By Number Of Cell Types")
+
+p_gene_overlap <- ggplot(overlap_summary,
+                         aes(x = factor(n_celltypes), y = n_genes, fill = factor(n_celltypes))) +
+  geom_col() +
+  geom_text(aes(label = n_genes), vjust = -0.5, size = 4) +
+  scale_fill_brewer(palette = "Set3") +
+  labs(title = "NMD Susceptible Genes By Cell-Type Consistency",
+       x = "Number Of Cell Types With NMD Response",
+       y = "Number Of Genes") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none",
+        plot.title      = element_text(face = "bold"))
+
+ggsave(file.path(OUT_DIR_FIG, paste0("gene_overlap_lr_iso_", DATE_STAMP, ".png")),
+       p_gene_overlap, width = 8, height = 5, dpi = 300, bg = "white")
+
+print(p_gene_overlap)
+
+write_tsv(gene_celltype_counts,
+          file.path(OUTPUT_DIR, paste0("mashr_die_gene_celltype_overlap_", DATE_STAMP, ".tsv")))
+
+```
+
+## Core NMD Target Genes
+
+```{r core-nmd-genes}
+core_genes <- gene_celltype_counts %>%
+  filter(n_celltypes >= length(CT_DISPLAY_ORDER)) %>%
+  arrange(desc(n_celltypes), gene_symbol)
+
+cat("Core NMD target genes (all", length(CT_DISPLAY_ORDER), "cell types):", nrow(core_genes), "\n")
+
+if (nrow(core_genes) > 0) {
+  knitr::kable(head(core_genes, 50), caption = "Core NMD Target Genes (All Cell Types)")
+
+  write_tsv(core_genes, file.path(OUTPUT_DIR, paste0("mashr_die_core_nmd_genes_", DATE_STAMP, ".tsv")))
+
+  core_gene_transcripts <- nmd_responsive %>%
+    filter(gene_group_id %in% core_genes$gene_group_id) %>%
+    select(cell_type, gene_group_id, gene_symbol, transcript_id, logFC, adj.P.Val) %>%
+    arrange(gene_group_id, cell_type, desc(logFC))
+  write_tsv(core_gene_transcripts,
+            file.path(OUTPUT_DIR, paste0("mashr_die_core_gene_transcripts_", DATE_STAMP, ".tsv")))
+}
+```
+
+## Cell-Type-Specific Genes
+
+```{r celltype-specific-genes, results='asis'}
+celltype_specific_genes <- gene_celltype_counts %>%
+  filter(n_celltypes == 1) %>%
+  left_join(nmd_responsive_genes %>% select(gene_group_id, cell_type),
+            by = "gene_group_id") %>%
+  arrange(cell_type, gene_symbol)
+
+specific_summary <- celltype_specific_genes %>%
+  group_by(cell_type) %>%
+  summarize(n_genes = n(), .groups = "drop")
+
+knitr::kable(specific_summary, caption = "Cell-Type-Specific NMD Susceptible Genes")
+
+for (ct in CT_DISPLAY_ORDER) {
+  ct_specific <- celltype_specific_genes %>%
+    filter(cell_type == ct) %>%
+    select(gene_symbol, gene_group_id) %>%
+    head(20)
+  if (nrow(ct_specific) > 0) {
+    cat("\n**", ct, "** (",
+        sum(celltype_specific_genes$cell_type == ct), " total)\n\n")
+    print(knitr::kable(ct_specific, row.names = FALSE))
+    cat("\n")
+  }
+}
+
+write_tsv(celltype_specific_genes,
+          file.path(OUTPUT_DIR, paste0("mashr_die_celltype_specific_genes_", DATE_STAMP, ".tsv")))
+
+```
+
+```{r overlap-interpretation}
+total_genes  <- n_distinct(nmd_responsive_genes$gene_group_id)
+genes_in_all <- sum(gene_celltype_counts$n_celltypes == length(CT_DISPLAY_ORDER))
+genes_in_1   <- sum(gene_celltype_counts$n_celltypes == 1)
+
+cat("**Summary:**\n")
+cat("- Total unique genes with NMD susceptible transcripts:", total_genes, "\n")
+cat("- Genes in all 4 cell types:", genes_in_all,
+    "(", round(100 * genes_in_all / total_genes, 1), "%)\n")
+cat("- Genes in only 1 cell type:", genes_in_1,
+    "(", round(100 * genes_in_1 / total_genes, 1), "%)\n")
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

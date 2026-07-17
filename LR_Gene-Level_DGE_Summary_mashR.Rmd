@@ -1,0 +1,820 @@
+---
+title: "Long-Read Gene-Level DGE Summary: NMD Inhibition Effects"
+author: "Leshem, Yul"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: lumen
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+---
+
+Code location: `/udd/reyle/nmd_lungcells_2026/code/final/LR_Gene-Level_DGE_Summary_mashR.Rmd`
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Analysis Overview
+
+This report summarizes long-read gene-level differential expression (posterior
+estimates) for the Smg1i (NMD inhibitor) vs DMSO contrast across four primary
+human lung cell types (AT, DD, FB, MV).
+
+Effect sizes (`logFC`) are posterior means from multivariate adaptive shrinkage,
+which borrows strength across cell types. Significance is the local false sign
+rate (lfsr); lfsr < 0.05 means there is < 5% probability that the sign of the
+effect estimate is wrong. lfsr is carried in the `adj.P.Val` column for
+column-format compatibility with topTables.
+
+**Definitions:**
+
+- **NMD-Responsive Gene:** posterior mean logFC > 0 AND lfsr < 0.05 (canonical Smg1i-up signature).
+- **NMD-Suppressed Gene:** posterior mean logFC < 0 AND lfsr < 0.05.
+- **logFC:** posterior mean log2 fold change.
+- **adj.P.Val:** local false sign rate (lfsr).
+
+```{r config, include=FALSE}
+INPUT_DGE_DIR    <- "/udd/reyle/nmd_lungcells_2026/long_read/mashr_gene"
+DATE_STAMP       <- "2026.3.10"
+DGE_FILE_PATTERN <- "^nmd_mashr_lr_dge_.*_2026\\.3\\.10\\.csv$"
+
+OUTPUT_DIR  <- file.path("/udd/reyle/nmd_lungcells_2026/tmp/mashr_lr_gene")
+OUT_DIR_FIG <- "/udd/reyle/nmd_lungcells_2026/final_figures/lr_gene"
+
+OUTPUT_SUMMARY            <- file.path(OUTPUT_DIR, paste0("mashr_lr_gene_summary_statistics_",     DATE_STAMP, ".tsv"))
+OUTPUT_TOP_HITS           <- file.path(OUTPUT_DIR, paste0("mashr_lr_gene_top_nmd_responsive_",     DATE_STAMP, ".tsv"))
+OUTPUT_CELLTYPE_OVERLAP   <- file.path(OUTPUT_DIR, paste0("mashr_lr_gene_celltype_overlap_",       DATE_STAMP, ".tsv"))
+OUTPUT_CORE_TARGETS       <- file.path(OUTPUT_DIR, paste0("mashr_lr_gene_core_nmd_targets_",       DATE_STAMP, ".tsv"))
+OUTPUT_CELLTYPE_SPECIFIC  <- file.path(OUTPUT_DIR, paste0("mashr_lr_gene_celltype_specific_",      DATE_STAMP, ".tsv"))
+OUTPUT_CHARACTERISTICS    <- file.path(OUTPUT_DIR, paste0("mashr_lr_gene_characteristics_",        DATE_STAMP, ".tsv"))
+OUTPUT_GSEA_ALL           <- file.path(OUTPUT_DIR, paste0("mashr_lr_gene_gsea_results_",           DATE_STAMP, ".tsv"))
+OUTPUT_GSEA_SIG           <- file.path(OUTPUT_DIR, paste0("mashr_lr_gene_gsea_significant_",       DATE_STAMP, ".tsv"))
+
+SIGNIFICANCE_THRESHOLD <- 0.05
+TOP_HITS_N             <- 500
+
+CELLTYPE_MAP     <- c("at" = "AT", "dd" = "DD", "fb" = "FB", "mv" = "MV")
+CT_DISPLAY_ORDER <- c("AT", "DD", "FB", "MV")
+
+if (!dir.exists(INPUT_DGE_DIR)) stop("DGE directory not found: ", INPUT_DGE_DIR)
+dir.create(OUTPUT_DIR,  recursive = TRUE, showWarnings = FALSE)
+dir.create(OUT_DIR_FIG, recursive = TRUE, showWarnings = FALSE)
+```
+
+<style>
+body { font-size: 16px; }
+p, li { font-size: 16px; line-height: 1.6; }
+</style>
+
+# Libraries
+
+```{r load-libs}
+library(tidyverse)
+library(data.table)
+library(DT)
+library(edgeR)
+library(tibble)
+library(rlang)
+
+# Bioconductor namespace masking guard
+select <- dplyr::select
+filter <- dplyr::filter
+rename <- dplyr::rename
+count  <- dplyr::count
+slice  <- dplyr::slice
+first  <- dplyr::first
+```
+
+# Load DGE Data
+
+```{r load-dge}
+dge_files <- list.files(INPUT_DGE_DIR, pattern = DGE_FILE_PATTERN, full.names = TRUE)
+cat("Loading", length(dge_files), "DGE files\n")
+
+# File pattern: nmd_mashr_lr_dge_<ct>_2026.3.10.csv
+# Splitting by underscore: parts[1]="nmd", [2]="mashr", [3]="lr", [4]="dge",
+# [5]=<ct>, [6]="2026.3.10.csv"  -> cell type lives at parts[5]
+all_gene_dge <- map_df(dge_files, ~{
+  df       <- read_csv(.x, show_col_types = FALSE)
+  parts    <- str_split(basename(.x), "_")[[1]]
+  df$cell_type_file <- parts[5]
+  df
+})
+
+all_gene_dge$cell_type <- CELLTYPE_MAP[all_gene_dge$cell_type_file]
+all_gene_dge <- all_gene_dge %>% filter(!is.na(cell_type))
+
+all_gene_dge <- all_gene_dge %>%
+  mutate(
+    valid_symbol = !is.na(hgnc_symbol) & hgnc_symbol != "" & !str_detect(hgnc_symbol, "^ENSG"),
+    gene_display = ifelse(valid_symbol, hgnc_symbol, ensembl_gene_id_version)
+  )
+
+cat("Loaded:", nrow(all_gene_dge), "rows\n")
+cat("Cell types:", paste(unique(all_gene_dge$cell_type), collapse = ", "), "\n")
+```
+
+# Summary Statistics
+
+```{r summary-stats}
+summary_stats <- all_gene_dge %>%
+  group_by(cell_type) %>%
+  summarize(
+    n_genes_tested            = n(),
+    n_valid_symbols           = sum(valid_symbol),
+    n_sig                     = sum(adj.P.Val < SIGNIFICANCE_THRESHOLD),
+    pct_sig                   = 100 * n_sig / n(),
+    n_nmd_responsive          = sum(logFC > 0 & adj.P.Val < SIGNIFICANCE_THRESHOLD),
+    pct_nmd_responsive        = ifelse(n_sig > 0, 100 * n_nmd_responsive / n_sig, 0),
+    n_nmd_suppressed          = sum(logFC < 0 & adj.P.Val < SIGNIFICANCE_THRESHOLD),
+    pct_nmd_suppressed        = ifelse(n_sig > 0, 100 * n_nmd_suppressed / n_sig, 0),
+    mean_logFC_responsive     = mean(logFC[logFC > 0 & adj.P.Val < SIGNIFICANCE_THRESHOLD]),
+    median_logFC_responsive   = median(logFC[logFC > 0 & adj.P.Val < SIGNIFICANCE_THRESHOLD]),
+    .groups = "drop"
+  )
+
+cat("**Table 1.** Long-Read Gene-Level Summary Statistics By Cell Type\n\n")
+
+datatable(summary_stats,
+          options = list(pageLength = 10, scrollX = TRUE),
+          caption = "Table 1. Long-Read Gene-Level Summary Statistics By Cell Type") %>%
+  formatRound(columns = c("pct_sig", "pct_nmd_responsive", "pct_nmd_suppressed",
+                          "mean_logFC_responsive", "median_logFC_responsive"),
+              digits = 2)
+
+write_tsv(summary_stats, OUTPUT_SUMMARY)
+knitr::kable(summary_stats, format = "pipe", digits = 2)
+```
+
+## Identify NMD-Responsive Genes
+
+```{r identify-nmd-responsive}
+nmd_responsive_genes <- all_gene_dge %>%
+  filter(logFC > 0, adj.P.Val < SIGNIFICANCE_THRESHOLD) %>%
+  select(cell_type, ensembl_gene_id_version, hgnc_symbol, gene_display,
+         logFC, adj.P.Val)
+
+cat("Total NMD-responsive rows:",   nrow(nmd_responsive_genes), "\n")
+cat("Unique NMD-responsive genes:", n_distinct(nmd_responsive_genes$ensembl_gene_id_version), "\n\n")
+
+print(
+  nmd_responsive_genes %>%
+    group_by(cell_type) %>%
+    summarize(n_nmd_genes  = n(),
+              mean_logFC   = mean(logFC),
+              median_logFC = median(logFC),
+              .groups = "drop")
+)
+```
+
+# Top NMD-Responsive Genes
+
+```{r top-hits}
+top_hits_dt_list <- list()
+table_num <- 2
+
+for (ct in CT_DISPLAY_ORDER) {
+  if (!ct %in% all_gene_dge$cell_type) next
+
+  top_hits <- nmd_responsive_genes %>%
+    filter(cell_type == ct) %>%
+    arrange(adj.P.Val) %>%
+    head(TOP_HITS_N) %>%
+    select(hgnc_symbol, gene_display, logFC, adj.P.Val)
+
+  top_hits_dt_list[[ct]] <- htmltools::tagList(
+    htmltools::h3(paste0(ct, " — Top ", TOP_HITS_N, " NMD-Responsive Genes")),
+    datatable(
+      top_hits,
+      options   = list(pageLength = 10, scrollX = TRUE),
+      caption   = paste0("Table ", table_num, ". Top ", TOP_HITS_N, " NMD-Responsive Genes In ", ct),
+      elementId = paste0("top_hits_lr_dt_", ct)
+    ) %>%
+      formatRound(columns = c("logFC", "adj.P.Val"), digits = 4)
+  )
+  table_num <- table_num + 1
+}
+
+write_tsv(nmd_responsive_genes, OUTPUT_TOP_HITS)
+
+htmltools::tagList(top_hits_dt_list)
+```
+
+# Visualizations
+
+## Volcano Plots
+
+```{r volcano-plots, fig.width=10, fig.height=10}
+volcano_data <- all_gene_dge %>%
+  mutate(
+    neg_log10_lfsr = -log10(adj.P.Val + 1e-300),
+    is_nmd_responsive = logFC > 0 & adj.P.Val < SIGNIFICANCE_THRESHOLD,
+    significance = case_when(
+      is_nmd_responsive                  ~ "NMD-Responsive",
+      adj.P.Val < SIGNIFICANCE_THRESHOLD ~ "Significant (Other)",
+      TRUE                               ~ "Not Significant"
+    )
+  )
+volcano_data$cell_type <- factor(volcano_data$cell_type, levels = CT_DISPLAY_ORDER)
+
+p_volcano <- ggplot(volcano_data,
+                    aes(x = logFC, y = neg_log10_lfsr, color = significance)) +
+  geom_point(alpha = 0.5, size = 1.2) +
+  facet_wrap(~ cell_type, ncol = 2) +
+  scale_color_manual(values = c(
+    "NMD-Responsive"      = "steelblue",
+    "Significant (Other)" = "coral",
+    "Not Significant"     = "gray70"
+  )) +
+  coord_cartesian(ylim = c(0, 50)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  labs(
+    title    = "Volcano Plots",
+    subtitle = "Posterior mean logFC vs −log10(lfsr); y-axis capped at 50",
+    x        = "Posterior Mean log2 FC (Smg1i Vs DMSO)",
+    y        = expression(-log[10]("lfsr")),
+    color    = "Status"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "top",
+    legend.title    = element_text(face = "bold"),
+    strip.text      = element_text(size = 13, face = "bold"),
+    plot.title      = element_text(size = 14, face = "bold"),
+    plot.subtitle   = element_text(color = "grey40")
+  )
+
+ggsave(file.path(OUT_DIR_FIG, paste0("volcano_2x2_lr_gene_", DATE_STAMP, ".png")),
+       p_volcano, width = 10, height = 10, dpi = 300, bg = "white")
+
+print(p_volcano)
+```
+
+## logFC Distribution
+
+```{r logfc-distribution, fig.width=10, fig.height=6}
+median_logfc <- nmd_responsive_genes %>%
+  group_by(cell_type) %>%
+  summarize(median_logFC = median(logFC), .groups = "drop")
+
+p_dens <- ggplot(nmd_responsive_genes, aes(x = logFC, fill = cell_type, color = cell_type)) +
+  geom_density(alpha = 0.3, linewidth = 1) +
+  geom_vline(data = median_logfc, aes(xintercept = median_logFC, color = cell_type),
+             linetype = "dashed", linewidth = 0.8) +
+  labs(
+    title    = "logFC Distribution For NMD-Responsive Genes",
+    subtitle = "Posterior mean logFC; dashed lines = per-cell-type median",
+    x = "Posterior Mean log2 FC (Smg1i Vs DMSO)",
+    y = "Density",
+    fill = "Cell Type", color = "Cell Type"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top",
+        plot.title = element_text(face = "bold"))
+
+ggsave(file.path(OUT_DIR_FIG, paste0("logfc_density_lr_gene_", DATE_STAMP, ".png")),
+       p_dens, width = 10, height = 6, dpi = 300, bg = "white")
+
+print(p_dens)
+```
+
+# Cell-Type Comparison
+
+## Overlap Counts
+
+```{r celltype-overlap}
+gene_celltype_counts <- nmd_responsive_genes %>%
+  group_by(ensembl_gene_id_version, hgnc_symbol, gene_display) %>%
+  summarize(
+    n_celltypes = n_distinct(cell_type),
+    celltypes   = paste(sort(unique(cell_type)), collapse = ", "),
+    mean_logFC  = mean(logFC),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_celltypes), desc(mean_logFC))
+
+overlap_summary <- gene_celltype_counts %>%
+  count(n_celltypes, name = "n_genes") %>%
+  mutate(pct_genes = 100 * n_genes / sum(n_genes))
+
+cat("**Table 8.** Genes By Number Of Cell Types With NMD Response\n\n")
+print(overlap_summary)
+
+p_overlap <- ggplot(overlap_summary,
+                    aes(x = factor(n_celltypes), y = n_genes, fill = factor(n_celltypes))) +
+  geom_col() +
+  geom_text(aes(label = n_genes), vjust = -0.5, size = 4) +
+  scale_fill_brewer(palette = "Set3") +
+  labs(
+    title = "NMD-Responsive Genes By Cell-Type Consistency",
+    x = "Number Of Cell Types With NMD Response",
+    y = "Number Of Genes"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"))
+
+ggsave(file.path(OUT_DIR_FIG, paste0("celltype_overlap_lr_gene_", DATE_STAMP, ".png")),
+       p_overlap, width = 8, height = 5, dpi = 300, bg = "white")
+
+print(p_overlap)
+write_tsv(gene_celltype_counts, OUTPUT_CELLTYPE_OVERLAP)
+```
+
+```{r upset-summary-table}
+upset_summary <- nmd_responsive_genes %>%
+  group_by(ensembl_gene_id_version) %>%
+  summarise(
+    n_cts      = n_distinct(cell_type),
+    cts        = paste(sort(unique(cell_type)), collapse = " & "),
+    mean_logFC = round(mean(logFC), 3),
+    .groups = "drop"
+  ) %>%
+  count(n_cts, cts, name = "n_genes") %>%
+  arrange(desc(n_cts), desc(n_genes))
+
+knitr::kable(upset_summary,
+             caption = "NMD-Responsive Gene Intersection Sizes By Cell-Type Combination")
+```
+
+## NMD-Responsive In 2+ Cell Types
+
+```{r multi-celltype-table}
+multi_celltype_genes <- gene_celltype_counts %>%
+  filter(n_celltypes >= 2) %>%
+  arrange(desc(n_celltypes), desc(mean_logFC))
+
+cat("Genes responsive in 2+ cell types:", nrow(multi_celltype_genes), "\n\n")
+
+if (nrow(multi_celltype_genes) > 0) {
+  multi_celltype_wide <- nmd_responsive_genes %>%
+    filter(cell_type %in% CT_DISPLAY_ORDER) %>%
+    semi_join(multi_celltype_genes, by = "ensembl_gene_id_version") %>%
+    select(ensembl_gene_id_version, gene_display, cell_type, logFC) %>%
+    pivot_wider(
+      id_cols     = c(ensembl_gene_id_version, gene_display),
+      names_from  = cell_type,
+      values_from = logFC,
+      values_fill = NA,
+      names_prefix = "logFC_"
+    ) %>%
+    left_join(
+      gene_celltype_counts %>% select(ensembl_gene_id_version, n_celltypes),
+      by = "ensembl_gene_id_version"
+    ) %>%
+    select(gene_display, n_celltypes, starts_with("logFC_")) %>%
+    filter(if_any(starts_with("logFC_"), ~ !is.na(.))) %>%
+    arrange(desc(n_celltypes))
+
+  output_multi_celltype <- file.path(OUTPUT_DIR,
+                                     paste0("mashr_lr_gene_multi_celltype_nmd_", DATE_STAMP, ".tsv"))
+  write_tsv(multi_celltype_wide, output_multi_celltype)
+
+  logfc_cols <- colnames(multi_celltype_wide)[grepl("^logFC_", colnames(multi_celltype_wide))]
+
+  datatable(
+    multi_celltype_wide,
+    options = list(pageLength = 25, scrollX = TRUE),
+    caption = "Table 8A. NMD-Responsive Genes Present In 2 Or More Cell Types"
+  ) %>%
+    formatRound(columns = logfc_cols, digits = 3)
+}
+```
+
+## Core NMD Targets (≥ 4 Cell Types)
+
+```{r core-targets}
+core_targets <- gene_celltype_counts %>%
+  filter(n_celltypes >= 4) %>%
+  arrange(desc(n_celltypes), desc(mean_logFC))
+
+cat("Core NMD targets (>=4 cell types):", nrow(core_targets), "\n\n")
+
+if (nrow(core_targets) > 0) {
+  core_targets_wide <- nmd_responsive_genes %>%
+    semi_join(core_targets, by = "ensembl_gene_id_version") %>%
+    select(ensembl_gene_id_version, gene_display, cell_type, logFC) %>%
+    group_by(ensembl_gene_id_version, gene_display, cell_type) %>%
+    summarise(logFC = mean(logFC), .groups = "drop") %>%
+    pivot_wider(
+      id_cols     = c(ensembl_gene_id_version, gene_display),
+      names_from  = cell_type,
+      values_from = logFC
+    ) %>%
+    select(-ensembl_gene_id_version)
+
+  cat("**Table 9.** Top 50 Core NMD Targets\n\n")
+  datatable(
+    core_targets_wide %>% head(50),
+    options = list(pageLength = 10, scrollX = TRUE),
+    caption = "Table 9. Top 50 Core NMD Targets"
+  ) %>%
+    formatRound(columns = 2:ncol(core_targets_wide), digits = 3)
+
+  if (nrow(core_targets) >= 30) {
+    top_core <- core_targets %>% head(30) %>% pull(ensembl_gene_id_version)
+
+    heatmap_df <- nmd_responsive_genes %>%
+      filter(ensembl_gene_id_version %in% top_core) %>%
+      mutate(display_name = ifelse(!is.na(hgnc_symbol) & hgnc_symbol != "",
+                                   hgnc_symbol, gene_display)) %>%
+      group_by(ensembl_gene_id_version, display_name, cell_type) %>%
+      summarise(logFC = mean(logFC), .groups = "drop")
+    heatmap_df$cell_type <- factor(heatmap_df$cell_type, levels = CT_DISPLAY_ORDER)
+
+    p_core <- ggplot(heatmap_df, aes(x = cell_type, y = display_name, fill = logFC)) +
+      geom_tile(color = "white") +
+      scale_fill_gradient(low = "white", high = "steelblue", name = "logFC") +
+      labs(title = "Top 30 Core NMD Targets",
+           x = "Cell Type", y = NULL) +
+      theme_minimal(base_size = 12) +
+      theme(axis.text.y = element_text(size = 8),
+            plot.title  = element_text(hjust = 0.5, face = "bold"))
+
+    ggsave(file.path(OUT_DIR_FIG, paste0("core_nmd_targets_heatmap_lr_gene_", DATE_STAMP, ".png")),
+           p_core, width = 8, height = 9, dpi = 300, bg = "white")
+    print(p_core)
+  }
+
+  write_tsv(core_targets_wide, OUTPUT_CORE_TARGETS)
+}
+```
+
+## Cell-Type-Specific Genes (1 Cell Type Only)
+
+```{r celltype-specific}
+celltype_specific <- gene_celltype_counts %>%
+  filter(n_celltypes == 1) %>%
+  left_join(
+    nmd_responsive_genes %>% select(ensembl_gene_id_version, cell_type, logFC, adj.P.Val),
+    by = "ensembl_gene_id_version"
+  ) %>%
+  arrange(cell_type, desc(logFC))
+
+cat("Cell-type-specific genes:", nrow(celltype_specific), "\n\n")
+
+specific_summary <- celltype_specific %>%
+  group_by(cell_type) %>%
+  summarize(
+    n_genes               = n(),
+    mean_logFC_specific   = mean(logFC),
+    median_logFC_specific = median(logFC),
+    .groups = "drop"
+  )
+
+cat("**Table 10.** Cell-Type-Specific NMD-Responsive Genes\n\n")
+print(specific_summary)
+
+if (nrow(celltype_specific) > 0) {
+  cat("\n**Top 10 Cell-Type-Specific Genes Per Cell Type:**\n\n")
+  for (ct in CT_DISPLAY_ORDER) {
+    ct_specific <- celltype_specific %>%
+      filter(cell_type == ct) %>%
+      select(gene_display, logFC, adj.P.Val) %>%
+      head(10)
+    if (nrow(ct_specific) > 0) {
+      cat("**", ct, "**\n")
+      print(knitr::kable(ct_specific, digits = 4))
+      cat("\n")
+    }
+  }
+  write_tsv(celltype_specific, OUTPUT_CELLTYPE_SPECIFIC)
+}
+```
+
+# Gene Characteristics
+
+## Per-Sample Expression (CPM)
+
+```{r load-dgelist-for-expression}
+DGELIST_PATH <- "/udd/reyle/nmd_lungcells_2026/long_read/dge_gene_longread_filtered_2026.3.10.rds"
+
+if (file.exists(DGELIST_PATH)) {
+  dge_gene       <- readRDS(DGELIST_PATH)
+  cpm_normalized <- cpm(dge_gene, normalized = TRUE, log = FALSE)
+
+  sample_metadata <- dge_gene$samples %>%
+    rownames_to_column("sample_name")
+
+  if ("treatment" %in% colnames(sample_metadata) && "ct" %in% colnames(sample_metadata)) {
+    sample_metadata <- sample_metadata %>%
+      select(sample_name, treatment, ct) %>%
+      mutate(cell_type = ifelse(ct == "AT2", "AT", ct)) %>%
+      select(-ct)
+    has_condition_data <- TRUE
+  } else {
+    has_condition_data <- FALSE
+  }
+
+  if (exists("sample_metadata") && has_condition_data) {
+    cpm_long <- as.data.frame(cpm_normalized) %>%
+      mutate(dgelist_gene_id = rownames(.)) %>%
+      pivot_longer(-dgelist_gene_id, names_to = "sample_name", values_to = "cpm") %>%
+      left_join(sample_metadata, by = "sample_name")
+
+    gene_info <- dge_gene$genes %>% rownames_to_column("dgelist_gene_id")
+    ensembl_col <- if ("ensembl_gene_id_version" %in% colnames(gene_info)) {
+      "ensembl_gene_id_version"
+    } else if ("gene_id" %in% colnames(gene_info)) {
+      "gene_id"
+    } else NULL
+
+    gene_info <- if (!is.null(ensembl_col)) {
+      gene_info %>% select(dgelist_gene_id, !!sym(ensembl_col), hgnc_symbol)
+    } else {
+      gene_info %>% select(dgelist_gene_id, hgnc_symbol)
+    }
+
+    cpm_long <- cpm_long %>% left_join(gene_info, by = "dgelist_gene_id")
+    gene_id_column <- ensembl_col
+  }
+} else {
+  has_condition_data <- FALSE
+  gene_id_column <- NULL
+}
+```
+
+## Expression Distribution Of NMD-Responsive Genes (DMSO)
+
+```{r expression-violin-dmso, fig.width=10, fig.height=10}
+if (has_condition_data && !is.null(gene_id_column)) {
+  responsive_ids <- unique(nmd_responsive_genes$ensembl_gene_id_version)
+
+  cpm_responsive <- cpm_long %>%
+    filter(treatment == "DMSO",
+           !!sym(gene_id_column) %in% responsive_ids,
+           cell_type %in% CT_DISPLAY_ORDER)
+
+  if (nrow(cpm_responsive) > 0) {
+    cpm_responsive$cell_type <- factor(cpm_responsive$cell_type, levels = CT_DISPLAY_ORDER)
+
+    p_dmso <- ggplot(cpm_responsive, aes(x = cell_type, y = log2(cpm + 1), fill = cell_type)) +
+      geom_violin(alpha = 0.7, scale = "width") +
+      geom_boxplot(width = 0.15, outlier.alpha = 0.2, fill = "white") +
+      facet_wrap(~ cell_type, ncol = 2, scales = "free_x") +
+      labs(
+        title    = "Baseline Expression Of NMD-Responsive Genes (DMSO)",
+        subtitle = "log2(CPM + 1) per sample",
+        x = "Cell Type", y = "log2(CPM + 1)"
+      ) +
+      theme_minimal(base_size = 13) +
+      theme(legend.position = "none",
+            strip.text      = element_text(face = "bold", size = 13),
+            plot.title      = element_text(face = "bold", hjust = 0.5),
+            plot.subtitle   = element_text(color = "grey40", hjust = 0.5))
+
+    ggsave(file.path(OUT_DIR_FIG,
+                     paste0("expression_dmso_2x2_lr_gene_", DATE_STAMP, ".png")),
+           p_dmso, width = 10, height = 10, dpi = 300, bg = "white")
+    print(p_dmso)
+  }
+}
+```
+
+## Expression Distribution Of NMD-Responsive Genes (Smg1i)
+
+```{r expression-violin-smg1i, fig.width=10, fig.height=10}
+if (has_condition_data && !is.null(gene_id_column)) {
+  cpm_responsive_smg1i <- cpm_long %>%
+    filter(treatment == "Smg1i",
+           !!sym(gene_id_column) %in% responsive_ids,
+           cell_type %in% CT_DISPLAY_ORDER)
+
+  if (nrow(cpm_responsive_smg1i) > 0) {
+    cpm_responsive_smg1i$cell_type <- factor(cpm_responsive_smg1i$cell_type,
+                                             levels = CT_DISPLAY_ORDER)
+
+    p_smg1i <- ggplot(cpm_responsive_smg1i, aes(x = cell_type, y = log2(cpm + 1), fill = cell_type)) +
+      geom_violin(alpha = 0.7, scale = "width") +
+      geom_boxplot(width = 0.15, outlier.alpha = 0.2, fill = "white") +
+      facet_wrap(~ cell_type, ncol = 2, scales = "free_x") +
+      labs(
+        title    = "Smg1i Expression Of NMD-Responsive Genes",
+        subtitle = "log2(CPM + 1) per sample",
+        x = "Cell Type", y = "log2(CPM + 1)"
+      ) +
+      theme_minimal(base_size = 13) +
+      theme(legend.position = "none",
+            strip.text      = element_text(face = "bold", size = 13),
+            plot.title      = element_text(face = "bold", hjust = 0.5),
+            plot.subtitle   = element_text(color = "grey40", hjust = 0.5))
+
+    ggsave(file.path(OUT_DIR_FIG,
+                     paste0("expression_smg1i_2x2_lr_gene_", DATE_STAMP, ".png")),
+           p_smg1i, width = 10, height = 10, dpi = 300, bg = "white")
+    print(p_smg1i)
+  }
+}
+```
+
+## Effect Size Distribution
+
+```{r effect-size, fig.width=10, fig.height=6}
+nmd_responsive_genes$cell_type <- factor(nmd_responsive_genes$cell_type, levels = CT_DISPLAY_ORDER)
+
+p_effect <- ggplot(nmd_responsive_genes, aes(x = cell_type, y = logFC, fill = cell_type)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.3) +
+  geom_hline(yintercept = 2, linetype = "dashed", color = "red", linewidth = 0.8) +
+  labs(
+    title    = "logFC Distribution For NMD-Responsive Genes",
+    subtitle = "Red line: logFC = 2 (4-fold). Values are posterior means.",
+    x = "Cell Type", y = "Posterior Mean log2 FC"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none",
+        plot.title      = element_text(face = "bold"))
+
+ggsave(file.path(OUT_DIR_FIG, paste0("logfc_boxplot_lr_gene_", DATE_STAMP, ".png")),
+       p_effect, width = 10, height = 6, dpi = 300, bg = "white")
+
+print(p_effect)
+
+extreme_fc_genes <- nmd_responsive_genes %>%
+  filter(abs(logFC) > 2) %>%
+  arrange(desc(logFC))
+
+cat("\n**Table 12.** Genes With |logFC| > 2:", nrow(extreme_fc_genes), "\n\n")
+print(extreme_fc_genes %>% group_by(cell_type) %>% summarize(n_extreme = n(), .groups = "drop"))
+
+characteristics_data <- nmd_responsive_genes %>%
+  select(cell_type, ensembl_gene_id_version, hgnc_symbol, gene_display, logFC, adj.P.Val) %>%
+  mutate(extreme_fc = abs(logFC) > 2)
+
+write_tsv(characteristics_data, OUTPUT_CHARACTERISTICS)
+```
+
+# GSEA: Pathway Enrichment
+
+## Load Gene Sets
+
+```{r load-genesets}
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+if (!require("fgsea",   quietly = TRUE)) BiocManager::install("fgsea")
+if (!require("msigdbr", quietly = TRUE)) install.packages("msigdbr")
+
+library(fgsea)
+library(msigdbr)
+
+GSEA_MIN_SIZE      <- 15
+GSEA_MAX_SIZE      <- 500
+GSEA_FDR_THRESHOLD <- 0.05
+
+msigdb_h        <- msigdbr(species = "Homo sapiens", collection = "H")
+msigdb_bp       <- msigdbr(species = "Homo sapiens", collection = "C5", subcollection = "GO:BP")
+msigdb_kegg     <- msigdbr(species = "Homo sapiens", collection = "C2", subcollection = "CP:KEGG_LEGACY")
+msigdb_reactome <- msigdbr(species = "Homo sapiens", collection = "C2", subcollection = "CP:REACTOME")
+
+all_genesets <- bind_rows(
+  msigdb_h        %>% mutate(collection = "Hallmark"),
+  msigdb_bp       %>% mutate(collection = "GO_BP"),
+  msigdb_kegg     %>% mutate(collection = "KEGG"),
+  msigdb_reactome %>% mutate(collection = "Reactome")
+)
+
+pathways <- all_genesets %>% split(x = .$gene_symbol, f = .$gs_name)
+pathways_filtered <- pathways[
+  sapply(pathways, length) >= GSEA_MIN_SIZE &
+  sapply(pathways, length) <= GSEA_MAX_SIZE
+]
+
+cat("Pathways after size filter:", length(pathways_filtered), "\n")
+```
+
+## Build Per-Cell-Type Rankings
+
+```{r prepare-rankings}
+rankings_per_celltype <- list()
+
+for (ct in CT_DISPLAY_ORDER) {
+  if (!ct %in% all_gene_dge$cell_type) next
+
+  ranked_data <- all_gene_dge %>%
+    filter(cell_type == ct, valid_symbol) %>%
+    group_by(hgnc_symbol) %>%
+    slice_max(order_by = abs(logFC), n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    arrange(desc(logFC))
+
+  ranked_vector <- setNames(ranked_data$logFC, ranked_data$hgnc_symbol)
+  rankings_per_celltype[[ct]] <- ranked_vector
+}
+```
+
+## Run GSEA
+
+```{r run-gsea}
+gsea_results_all <- list()
+gsea_dt_list     <- list()
+
+for (ct in names(rankings_per_celltype)) {
+  ranked_list <- rankings_per_celltype[[ct]]
+
+  gsea_res <- fgsea(
+    pathways = pathways_filtered,
+    stats    = ranked_list,
+    minSize  = GSEA_MIN_SIZE,
+    maxSize  = GSEA_MAX_SIZE
+  )
+  gsea_res$cell_type <- ct
+  gsea_results_all[[ct]] <- gsea_res
+
+  top_100 <- gsea_res %>%
+    filter(NES > 0, padj < 0.05) %>%
+    arrange(pval) %>%
+    head(100) %>%
+    select(pathway, pval, padj, ES, NES, size, leadingEdge) %>%
+    mutate(
+      pathway_short = str_trunc(pathway, 60),
+      leadingEdge   = sapply(leadingEdge, function(x) paste(head(x, 5), collapse = ", "))
+    ) %>%
+    select(pathway_short, pval, padj, ES, NES, size, leadingEdge)
+
+  gsea_dt_list[[ct]] <- htmltools::tagList(
+    htmltools::h3(paste0(ct, " — Top GSEA Results")),
+    datatable(
+      top_100,
+      options   = list(pageLength = 10, scrollX = TRUE),
+      caption   = paste0("Top GSEA Results — ", ct),
+      elementId = paste0("gsea_lr_dt_", ct)
+    ) %>%
+      formatRound(columns = c("pval", "padj", "ES", "NES"), digits = 4)
+  )
+}
+
+gsea_combined     <- bind_rows(gsea_results_all)
+gsea_combined_pos <- gsea_combined %>% filter(NES > 0)
+
+gsea_significant <- gsea_combined_pos %>%
+  filter(padj < GSEA_FDR_THRESHOLD) %>%
+  arrange(padj)
+
+gsea_combined$leadingEdge <- sapply(gsea_combined$leadingEdge, paste, collapse = ", ")
+write_tsv(gsea_combined, OUTPUT_GSEA_ALL)
+
+if (nrow(gsea_significant) > 0) {
+  gsea_significant$leadingEdge <- sapply(gsea_significant$leadingEdge, paste, collapse = ", ")
+  write_tsv(gsea_significant, OUTPUT_GSEA_SIG)
+}
+
+htmltools::tagList(gsea_dt_list)
+```
+
+## Cross-Cell-Type Pathway Consistency
+
+```{r pathway-consistency}
+pathway_counts_strict  <- gsea_combined_pos %>%
+  filter(padj < GSEA_FDR_THRESHOLD) %>% count(pathway) %>% arrange(desc(n)) %>% filter(n > 1)
+pathway_counts_relaxed <- gsea_combined_pos %>%
+  filter(padj < 0.1) %>%                count(pathway) %>% arrange(desc(n)) %>% filter(n > 1)
+
+cat("Pathways significant in >1 cell type (FDR <", GSEA_FDR_THRESHOLD, "):",
+    nrow(pathway_counts_strict), "\n")
+
+top_n <- 5
+
+if (nrow(pathway_counts_strict) > 0) {
+  cat("### Top Consistent Pathways (FDR <", GSEA_FDR_THRESHOLD, ")\n\n")
+  for (pw in head(pathway_counts_strict$pathway, top_n)) {
+    cat("\n**", pw, "**\n")
+    print(knitr::kable(
+      gsea_combined_pos %>%
+        filter(pathway == pw, padj < GSEA_FDR_THRESHOLD) %>%
+        select(cell_type, NES, padj) %>%
+        arrange(cell_type),
+      digits = 4
+    ))
+  }
+}
+```
+
+# Key Findings
+
+```{r key-findings}
+cat("**Long-Read Gene-Level NMD Response:**\n")
+cat("- Average per-cell-type NMD-responsive genes:",
+    round(mean(summary_stats$n_nmd_responsive)),
+    " (", round(mean(summary_stats$pct_nmd_responsive), 1), "%)\n")
+cat("- Mean posterior logFC:",
+    round(mean(summary_stats$mean_logFC_responsive),   2), "\n")
+cat("- Median posterior logFC:",
+    round(mean(summary_stats$median_logFC_responsive), 2), "\n\n")
+
+cat("**Cell-Type Consistency:**\n")
+cat("- Unique NMD-responsive genes:",
+    n_distinct(nmd_responsive_genes$ensembl_gene_id_version), "\n")
+if (exists("core_targets")      && nrow(core_targets)      > 0)
+  cat("- Core NMD targets (>=4 cell types):",     nrow(core_targets),      "\n")
+if (exists("celltype_specific") && nrow(celltype_specific) > 0)
+  cat("- Cell-type-specific:", nrow(celltype_specific), "\n")
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

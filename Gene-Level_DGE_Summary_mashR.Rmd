@@ -1,0 +1,834 @@
+---
+title: "Gene-Level DGE Summary: NMD Inhibition Effects"
+author: "Leshem, Yul"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: lumen
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+---
+git status
+git add -u
+git commit -m "your message"
+git pull --rebase
+git push
+Code location: /udd/reyle/nmd_lungcells_2026/code/final/Gene-Level_DGE_Summary_mashR.Rmd`
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Analysis Overview
+
+This report summarizes gene-level differential expression (posterior estimates)
+for the Smg1i (NMD inhibitor) vs DMSO contrast across four primary human lung
+cell types (AT2, LAE, FB, MV).
+
+Effect sizes (`logFC`) are posterior means from multivariate adaptive shrinkage,
+which borrows strength across cell types. Significance is the local false sign
+rate (lfsr); lfsr < 0.05 means there is < 5% probability that the sign of the
+effect estimate is wrong. lfsr is carried in the `adj.P.Val` column for
+column-format compatibility with topTables.
+
+**Definitions:**
+
+- **NMD susceptible gene:** posterior mean logFC > 0 AND lfsr < 0.05 (canonical Smg1i-up signature).
+- **NMD suppressed gene:** posterior mean logFC < 0 AND lfsr < 0.05.
+- **logFC:** posterior mean log2 fold change.
+- **adj.P.Val:** local false sign rate (lfsr).
+
+```{r config, include=FALSE}
+INPUT_DGE_DIR    <- "/udd/reyle/nmd_lungcells_2026/shortread_dge/mashr"
+DATE_STAMP       <- "2026.3.10"
+DGE_FILE_PATTERN <- "^nmd_mashr_dge_.*_2026\\.3\\.10\\.csv$"
+
+OUTPUT_DIR  <- file.path("/udd/reyle/nmd_lungcells_2026/tmp/mashr")
+OUT_DIR_FIG <- "/udd/reyle/nmd_lungcells_2026/final_figures/sr"
+
+OUTPUT_SUMMARY            <- file.path(OUTPUT_DIR, paste0("mashr_gene_summary_statistics_",     DATE_STAMP, ".tsv"))
+OUTPUT_TOP_HITS           <- file.path(OUTPUT_DIR, paste0("mashr_gene_top_nmd_susceptible_",    DATE_STAMP, ".tsv"))
+OUTPUT_CELLTYPE_OVERLAP   <- file.path(OUTPUT_DIR, paste0("mashr_gene_celltype_overlap_",       DATE_STAMP, ".tsv"))
+OUTPUT_CORE_TARGETS       <- file.path(OUTPUT_DIR, paste0("mashr_gene_core_nmd_targets_",       DATE_STAMP, ".tsv"))
+OUTPUT_CELLTYPE_SPECIFIC  <- file.path(OUTPUT_DIR, paste0("mashr_gene_celltype_specific_",      DATE_STAMP, ".tsv"))
+OUTPUT_CHARACTERISTICS    <- file.path(OUTPUT_DIR, paste0("mashr_gene_characteristics_",        DATE_STAMP, ".tsv"))
+OUTPUT_GSEA_ALL           <- file.path(OUTPUT_DIR, paste0("mashr_gene_gsea_results_",           DATE_STAMP, ".tsv"))
+OUTPUT_GSEA_SIG           <- file.path(OUTPUT_DIR, paste0("mashr_gene_gsea_significant_",       DATE_STAMP, ".tsv"))
+
+SIGNIFICANCE_THRESHOLD <- 0.05
+TOP_HITS_N             <- 500
+
+CELLTYPE_MAP     <- c("at2" = "AT2", "lae" = "LAE", "fb" = "FB", "mv" = "MV")
+CT_DISPLAY_ORDER <- c("AT2", "LAE", "FB", "MV")
+
+if (!dir.exists(INPUT_DGE_DIR)) stop("DGE directory not found: ", INPUT_DGE_DIR)
+dir.create(OUTPUT_DIR,  recursive = TRUE, showWarnings = FALSE)
+dir.create(OUT_DIR_FIG, recursive = TRUE, showWarnings = FALSE)
+```
+
+<style>
+body { font-size: 16px; }
+p, li { font-size: 16px; line-height: 1.6; }
+</style>
+
+# Libraries
+
+```{r load-libs}
+library(tidyverse)
+library(data.table)
+library(DT)
+library(edgeR)
+library(tibble)
+library(rlang)
+
+# Bioconductor namespace masking guard
+select <- dplyr::select
+filter <- dplyr::filter
+rename <- dplyr::rename
+count  <- dplyr::count
+slice  <- dplyr::slice
+```
+
+# Load DGE Data
+
+```{r load-dge}
+dge_files <- list.files(INPUT_DGE_DIR, pattern = DGE_FILE_PATTERN, full.names = TRUE)
+cat(sprintf("Loading %d per-cell-type DGE files from %s.\n", length(dge_files), INPUT_DGE_DIR))
+
+all_gene_dge <- map_df(dge_files, ~{
+  df       <- read_csv(.x, show_col_types = FALSE)
+  parts    <- str_split(basename(.x), "_")[[1]]
+  df$cell_type_file <- parts[4]   # file naming: nmd_mashr_dge_<ctcode>_<date>.csv
+  df
+})
+
+all_gene_dge$cell_type <- CELLTYPE_MAP[all_gene_dge$cell_type_file]
+all_gene_dge <- all_gene_dge %>% filter(!is.na(cell_type))
+
+all_gene_dge <- all_gene_dge %>%
+  mutate(
+    valid_symbol = !is.na(hgnc_symbol) & hgnc_symbol != "" & !str_detect(hgnc_symbol, "^ENSG"),
+    gene_display = ifelse(valid_symbol, hgnc_symbol, ensembl_gene_id_version)
+  )
+
+cat(sprintf("Loaded %d gene x cell-type rows across cell types: %s.\n",
+            nrow(all_gene_dge), paste(unique(all_gene_dge$cell_type), collapse = ", ")))
+cat(sprintf("Rows with a valid HGNC symbol (not an Ensembl ID): %d of %d.\n",
+            sum(all_gene_dge$valid_symbol), nrow(all_gene_dge)))
+```
+
+# Summary Statistics
+
+```{r summary-stats}
+summary_stats <- all_gene_dge %>%
+  group_by(cell_type) %>%
+  summarize(
+    n_genes_tested            = n(),
+    n_valid_symbols           = sum(valid_symbol),
+    n_sig                     = sum(adj.P.Val < SIGNIFICANCE_THRESHOLD),
+    pct_sig                   = 100 * n_sig / n(),
+    n_nmd_susceptible         = sum(logFC > 0 & adj.P.Val < SIGNIFICANCE_THRESHOLD),
+    pct_nmd_susceptible       = ifelse(n_sig > 0, 100 * n_nmd_susceptible / n_sig, 0),
+    n_nmd_suppressed          = sum(logFC < 0 & adj.P.Val < SIGNIFICANCE_THRESHOLD),
+    pct_nmd_suppressed        = ifelse(n_sig > 0, 100 * n_nmd_suppressed / n_sig, 0),
+    mean_logFC_susceptible    = mean(logFC[logFC > 0 & adj.P.Val < SIGNIFICANCE_THRESHOLD]),
+    median_logFC_susceptible  = median(logFC[logFC > 0 & adj.P.Val < SIGNIFICANCE_THRESHOLD]),
+    .groups = "drop"
+  )
+
+# Define every column term the first time a table uses them.
+cat("Table 1. Gene-level summary statistics by cell type.\n")
+cat("Column definitions:\n")
+cat("  n_genes_tested        = genes with a posterior estimate in this cell type.\n")
+cat("  n_valid_symbols       = genes with a real HGNC symbol (not an Ensembl ID).\n")
+cat("  n_sig                 = genes with lfsr < 0.05 (significant in either direction).\n")
+cat("  pct_sig               = n_sig as a percentage of genes tested.\n")
+cat("  n_nmd_susceptible     = significant genes with logFC > 0 (Smg1i-up; NMD susceptible).\n")
+cat("  pct_nmd_susceptible   = NMD-susceptible genes as a percentage of significant genes.\n")
+cat("  n_nmd_suppressed      = significant genes with logFC < 0 (Smg1i-down).\n")
+cat("  pct_nmd_suppressed    = NMD-suppressed genes as a percentage of significant genes.\n")
+cat("  mean/median_logFC_susceptible = average posterior logFC among NMD-susceptible genes.\n\n")
+
+datatable(summary_stats,
+          options = list(pageLength = 10, scrollX = TRUE),
+          caption = "Table 1. Gene-level summary statistics by cell type") %>%
+  formatRound(columns = c("pct_sig", "pct_nmd_susceptible", "pct_nmd_suppressed",
+                          "mean_logFC_susceptible", "median_logFC_susceptible"),
+              digits = 2)
+
+write_tsv(summary_stats, OUTPUT_SUMMARY)
+```
+
+## Identify NMD Susceptible Genes
+
+```{r identify-nmd-responsive}
+nmd_responsive_genes <- all_gene_dge %>%
+  filter(logFC > 0, adj.P.Val < SIGNIFICANCE_THRESHOLD) %>%
+  select(cell_type, ensembl_gene_id_version, hgnc_symbol, gene_display,
+         logFC, adj.P.Val)
+
+cat(sprintf("Total NMD-susceptible gene x cell-type rows: %d.\n", nrow(nmd_responsive_genes)))
+cat(sprintf("Unique NMD-susceptible genes (any cell type): %d.\n\n",
+            n_distinct(nmd_responsive_genes$ensembl_gene_id_version)))
+
+print(
+  nmd_responsive_genes %>%
+    group_by(cell_type) %>%
+    summarize(n_nmd_genes  = n(),          # NMD-susceptible genes in this cell type
+              mean_logFC   = mean(logFC),
+              median_logFC = median(logFC),
+              .groups = "drop")
+)
+```
+
+# Top NMD Susceptible Genes
+
+```{r top-hits}
+top_hits_dt_list <- list()
+table_num <- 2
+
+for (ct in CT_DISPLAY_ORDER) {
+  if (!ct %in% all_gene_dge$cell_type) next
+
+  top_hits <- nmd_responsive_genes %>%
+    filter(cell_type == ct) %>%
+    arrange(adj.P.Val) %>%
+    head(TOP_HITS_N) %>%
+    select(hgnc_symbol, gene_display, logFC, adj.P.Val)
+
+  top_hits_dt_list[[ct]] <- htmltools::tagList(
+    htmltools::h3(paste0(ct, " — Top ", TOP_HITS_N, " NMD Susceptible Genes")),
+    datatable(
+      top_hits,
+      options   = list(pageLength = 10, scrollX = TRUE),
+      caption   = paste0("Table ", table_num, ". Top ", TOP_HITS_N, " NMD Susceptible Genes In ", ct),
+      elementId = paste0("top_hits_dt_", ct)
+    ) %>%
+      formatRound(columns = c("logFC", "adj.P.Val"), digits = 4)
+  )
+  table_num <- table_num + 1
+}
+
+write_tsv(nmd_responsive_genes, OUTPUT_TOP_HITS)
+
+htmltools::tagList(top_hits_dt_list)
+```
+
+# Visualizations
+
+## Volcano Plots
+
+```{r volcano-plots, fig.width=10, fig.height=10}
+volcano_data <- all_gene_dge %>%
+  mutate(
+    neg_log10_lfsr = -log10(adj.P.Val + 1e-300),
+    is_nmd_responsive = logFC > 0 & adj.P.Val < SIGNIFICANCE_THRESHOLD,
+    significance = case_when(
+      is_nmd_responsive                  ~ "NMD susceptible",
+      adj.P.Val < SIGNIFICANCE_THRESHOLD ~ "Significant (Other)",
+      TRUE                               ~ "Not Significant"
+    )
+  )
+volcano_data$cell_type <- factor(volcano_data$cell_type, levels = CT_DISPLAY_ORDER)
+
+p_volcano <- ggplot(volcano_data,
+                    aes(x = logFC, y = neg_log10_lfsr, color = significance)) +
+  geom_point(alpha = 0.5, size = 1.2) +
+  facet_wrap(~ cell_type, ncol = 2) +
+  scale_color_manual(values = c(
+    "NMD susceptible"     = "steelblue",
+    "Significant (Other)" = "coral",
+    "Not Significant"     = "gray70"
+  )) +
+  coord_cartesian(ylim = c(0, 50)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  labs(
+    title    = "Volcano Plots",
+    subtitle = "Posterior mean logFC vs -log10(lfsr); y-axis capped at 50",
+    x        = "Posterior Mean log2 FC (Smg1i Vs DMSO)",
+    y        = expression(-log[10]("lfsr")),
+    color    = "Status"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "top",
+    legend.title    = element_text(face = "bold"),
+    strip.text      = element_text(size = 13, face = "bold"),
+    plot.title      = element_text(size = 14, face = "bold"),
+    plot.subtitle   = element_text(color = "grey40")
+  )
+
+ggsave(file.path(OUT_DIR_FIG, paste0("volcano_2x2_sr_", DATE_STAMP, ".png")),
+       p_volcano, width = 10, height = 10, dpi = 300, bg = "white")
+
+print(p_volcano)
+```
+
+## logFC Distribution
+
+```{r logfc-distribution, fig.width=10, fig.height=6}
+median_logfc <- nmd_responsive_genes %>%
+  group_by(cell_type) %>%
+  summarize(median_logFC = median(logFC), .groups = "drop")
+
+p_dens <- ggplot(nmd_responsive_genes, aes(x = logFC, fill = cell_type, color = cell_type)) +
+  geom_density(alpha = 0.3, linewidth = 1) +
+  geom_vline(data = median_logfc, aes(xintercept = median_logFC, color = cell_type),
+             linetype = "dashed", linewidth = 0.8) +
+  labs(
+    title    = "logFC Distribution For NMD Susceptible Genes",
+    subtitle = "Posterior mean logFC; dashed lines = per-cell-type median",
+    x = "Posterior Mean log2 FC (Smg1i Vs DMSO)",
+    y = "Density",
+    fill = "Cell Type", color = "Cell Type"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top",
+        plot.title = element_text(face = "bold"))
+
+ggsave(file.path(OUT_DIR_FIG, paste0("logfc_density_sr_", DATE_STAMP, ".png")),
+       p_dens, width = 10, height = 6, dpi = 300, bg = "white")
+
+print(p_dens)
+```
+
+# Cell-Type Comparison
+
+## Overlap Counts
+
+```{r celltype-overlap}
+gene_celltype_counts <- nmd_responsive_genes %>%
+  group_by(ensembl_gene_id_version, hgnc_symbol, gene_display) %>%
+  summarize(
+    n_celltypes = n_distinct(cell_type),   # number of cell types in which this gene is NMD susceptible
+    celltypes   = paste(sort(unique(cell_type)), collapse = ", "),
+    mean_logFC  = mean(logFC),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_celltypes), desc(mean_logFC))
+
+# Detailed breakdown by exact cell-type combination (single sharing table; replaces the
+# simpler count-only table, which is shown by the bar plot below).
+upset_summary <- nmd_responsive_genes %>%
+  group_by(ensembl_gene_id_version) %>%
+  summarise(
+    n_cts      = n_distinct(cell_type),
+    cts        = paste(sort(unique(cell_type)), collapse = " & "),
+    mean_logFC = round(mean(logFC), 3),
+    .groups = "drop"
+  ) %>%
+  count(n_cts, cts, name = "n_genes") %>%
+  arrange(desc(n_cts), desc(n_genes))
+
+overlap_summary <- gene_celltype_counts %>%
+  count(n_celltypes, name = "n_genes") %>%
+  mutate(pct_genes = 100 * n_genes / sum(n_genes))
+
+cat("Cell-type sharing of NMD-susceptible genes.\n")
+cat("  n_celltypes / n_cts = number of cell types in which a gene is NMD susceptible.\n")
+cat("  cts                 = the specific cell-type combination.\n")
+cat("  n_genes             = number of genes in that group.\n\n")
+
+knitr::kable(upset_summary,
+             caption = "NMD-susceptible gene intersection sizes by cell-type combination")
+
+p_overlap <- ggplot(overlap_summary,
+                    aes(x = factor(n_celltypes), y = n_genes, fill = factor(n_celltypes))) +
+  geom_col() +
+  geom_text(aes(label = n_genes), vjust = -0.5, size = 4) +
+  scale_fill_brewer(palette = "Set3") +
+  labs(
+    title = "NMD Susceptible Genes By Cell-Type Consistency",
+    x = "Number Of Cell Types Where Gene Is NMD Susceptible",
+    y = "Number Of Genes"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"))
+
+ggsave(file.path(OUT_DIR_FIG, paste0("celltype_overlap_sr_", DATE_STAMP, ".png")),
+       p_overlap, width = 8, height = 5, dpi = 300, bg = "white")
+
+print(p_overlap)
+write_tsv(gene_celltype_counts, OUTPUT_CELLTYPE_OVERLAP)
+```
+
+## NMD Susceptible In 2+ Cell Types
+
+```{r multi-celltype-table}
+multi_celltype_genes <- gene_celltype_counts %>%
+  filter(n_celltypes >= 2) %>%
+  arrange(desc(n_celltypes), desc(mean_logFC))
+
+cat(sprintf("Genes NMD susceptible in 2+ cell types: %d.\n\n", nrow(multi_celltype_genes)))
+
+if (nrow(multi_celltype_genes) > 0) {
+  multi_celltype_wide <- nmd_responsive_genes %>%
+    filter(cell_type %in% CT_DISPLAY_ORDER) %>%
+    semi_join(multi_celltype_genes, by = "ensembl_gene_id_version") %>%
+    select(ensembl_gene_id_version, gene_display, cell_type, logFC) %>%
+    pivot_wider(
+      id_cols     = c(ensembl_gene_id_version, gene_display),
+      names_from  = cell_type,
+      values_from = logFC,
+      values_fill = NA,
+      names_prefix = "logFC_"
+    ) %>%
+    left_join(
+      gene_celltype_counts %>% select(ensembl_gene_id_version, n_celltypes),
+      by = "ensembl_gene_id_version"
+    ) %>%
+    select(gene_display, n_celltypes, starts_with("logFC_")) %>%
+    filter(if_any(starts_with("logFC_"), ~ !is.na(.))) %>%
+    arrange(desc(n_celltypes))
+
+  output_multi_celltype <- file.path(OUTPUT_DIR,
+                                     paste0("mashr_gene_multi_celltype_nmd_", DATE_STAMP, ".tsv"))
+  write_tsv(multi_celltype_wide, output_multi_celltype)
+
+  logfc_cols <- colnames(multi_celltype_wide)[grepl("^logFC_", colnames(multi_celltype_wide))]
+
+  datatable(
+    multi_celltype_wide,
+    options = list(pageLength = 25, scrollX = TRUE),
+    caption = "NMD susceptible genes present in 2 or more cell types"
+  ) %>%
+    formatRound(columns = logfc_cols, digits = 3)
+}
+```
+
+## Core NMD Targets (>= 4 Cell Types)
+
+```{r core-targets}
+core_targets <- gene_celltype_counts %>%
+  filter(n_celltypes >= 4) %>%
+  arrange(desc(n_celltypes), desc(mean_logFC))
+
+cat(sprintf("Core NMD targets (NMD susceptible in all 4 cell types): %d.\n\n", nrow(core_targets)))
+
+if (nrow(core_targets) > 0) {
+  core_targets_wide <- nmd_responsive_genes %>%
+    semi_join(core_targets, by = "ensembl_gene_id_version") %>%
+    select(ensembl_gene_id_version, gene_display, cell_type, logFC) %>%
+    group_by(ensembl_gene_id_version, gene_display, cell_type) %>%
+    summarise(logFC = mean(logFC), .groups = "drop") %>%
+    pivot_wider(
+      id_cols     = c(ensembl_gene_id_version, gene_display),
+      names_from  = cell_type,
+      values_from = logFC
+    ) %>%
+    select(-ensembl_gene_id_version)
+
+  datatable(
+    core_targets_wide %>% head(50),
+    options = list(pageLength = 10, scrollX = TRUE),
+    caption = "Top 50 core NMD targets (NMD susceptible in all 4 cell types)"
+  ) %>%
+    formatRound(columns = 2:ncol(core_targets_wide), digits = 3)
+
+  if (nrow(core_targets) >= 30) {
+    top_core <- core_targets %>% head(30) %>% pull(ensembl_gene_id_version)
+
+    heatmap_df <- nmd_responsive_genes %>%
+      filter(ensembl_gene_id_version %in% top_core) %>%
+      mutate(display_name = ifelse(!is.na(hgnc_symbol) & hgnc_symbol != "",
+                                   hgnc_symbol, gene_display)) %>%
+      group_by(ensembl_gene_id_version, display_name, cell_type) %>%
+      summarise(logFC = mean(logFC), .groups = "drop")
+    heatmap_df$cell_type <- factor(heatmap_df$cell_type, levels = CT_DISPLAY_ORDER)
+
+    p_core <- ggplot(heatmap_df, aes(x = cell_type, y = display_name, fill = logFC)) +
+      geom_tile(color = "white") +
+      scale_fill_gradient(low = "white", high = "steelblue", name = "logFC") +
+      labs(title = "Top 30 Core NMD Targets",
+           x = "Cell Type", y = NULL) +
+      theme_minimal(base_size = 12) +
+      theme(axis.text.y = element_text(size = 8),
+            plot.title  = element_text(hjust = 0.5, face = "bold"))
+
+    ggsave(file.path(OUT_DIR_FIG, paste0("core_nmd_targets_heatmap_sr_", DATE_STAMP, ".png")),
+           p_core, width = 8, height = 9, dpi = 300, bg = "white")
+    print(p_core)
+  }
+
+  write_tsv(core_targets_wide, OUTPUT_CORE_TARGETS)
+}
+```
+
+## Cell-Type-Specific Genes (1 Cell Type Only)
+
+```{r celltype-specific}
+celltype_specific <- gene_celltype_counts %>%
+  filter(n_celltypes == 1) %>%
+  left_join(
+    nmd_responsive_genes %>% select(ensembl_gene_id_version, cell_type, logFC, adj.P.Val),
+    by = "ensembl_gene_id_version"
+  ) %>%
+  arrange(cell_type, desc(logFC))
+
+cat(sprintf("Cell-type-specific NMD-susceptible genes (susceptible in exactly one cell type): %d.\n\n",
+            nrow(celltype_specific)))
+
+specific_summary <- celltype_specific %>%
+  group_by(cell_type) %>%
+  summarize(
+    n_genes               = n(),
+    mean_logFC_specific   = mean(logFC),
+    median_logFC_specific = median(logFC),
+    .groups = "drop"
+  )
+
+print(specific_summary)
+
+if (nrow(celltype_specific) > 0) {
+  cat("\nTop 10 cell-type-specific NMD-susceptible genes per cell type:\n\n")
+  for (ct in CT_DISPLAY_ORDER) {
+    ct_specific <- celltype_specific %>%
+      filter(cell_type == ct) %>%
+      select(gene_display, logFC, adj.P.Val) %>%
+      head(10)
+    if (nrow(ct_specific) > 0) {
+      cat("**", ct, "**\n")
+      print(knitr::kable(ct_specific, digits = 4))
+      cat("\n")
+    }
+  }
+  write_tsv(celltype_specific, OUTPUT_CELLTYPE_SPECIFIC)
+}
+```
+
+# GSEA: Pathway Enrichment
+
+## Load Gene Sets
+
+```{r load-genesets}
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+if (!require("fgsea",   quietly = TRUE)) BiocManager::install("fgsea")
+if (!require("msigdbr", quietly = TRUE)) install.packages("msigdbr")
+
+library(fgsea)
+library(msigdbr)
+
+GSEA_MIN_SIZE      <- 15
+GSEA_MAX_SIZE      <- 500
+GSEA_FDR_THRESHOLD <- 0.05
+
+msigdb_h        <- msigdbr(species = "Homo sapiens", collection = "H")
+msigdb_bp       <- msigdbr(species = "Homo sapiens", collection = "C5", subcollection = "GO:BP")
+msigdb_kegg     <- msigdbr(species = "Homo sapiens", collection = "C2", subcollection = "CP:KEGG_LEGACY")
+msigdb_reactome <- msigdbr(species = "Homo sapiens", collection = "C2", subcollection = "CP:REACTOME")
+
+all_genesets <- bind_rows(
+  msigdb_h        %>% mutate(collection = "Hallmark"),
+  msigdb_bp       %>% mutate(collection = "GO_BP"),
+  msigdb_kegg     %>% mutate(collection = "KEGG"),
+  msigdb_reactome %>% mutate(collection = "Reactome")
+)
+
+pathways <- all_genesets %>% split(x = .$gene_symbol, f = .$gs_name)
+pathways_filtered <- pathways[
+  sapply(pathways, length) >= GSEA_MIN_SIZE &
+  sapply(pathways, length) <= GSEA_MAX_SIZE
+]
+
+cat(sprintf("Loaded %d gene sets; %d retained after size filter (%d-%d genes).\n",
+            length(pathways), length(pathways_filtered), GSEA_MIN_SIZE, GSEA_MAX_SIZE))
+```
+
+## Build Per-Cell-Type Rankings
+
+```{r prepare-rankings}
+rankings_per_celltype <- list()
+
+for (ct in CT_DISPLAY_ORDER) {
+  if (!ct %in% all_gene_dge$cell_type) next
+
+  ranked_data <- all_gene_dge %>%
+    filter(cell_type == ct, valid_symbol) %>%
+    group_by(hgnc_symbol) %>%
+    slice_max(order_by = abs(logFC), n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    arrange(desc(logFC))
+
+  ranked_vector <- setNames(ranked_data$logFC, ranked_data$hgnc_symbol)
+  rankings_per_celltype[[ct]] <- ranked_vector
+}
+cat(sprintf("Built ranked gene lists (by posterior logFC) for %d cell types: %s.\n",
+            length(rankings_per_celltype), paste(names(rankings_per_celltype), collapse = ", ")))
+```
+
+## Run GSEA
+
+```{r run-gsea}
+gsea_results_all <- list()
+gsea_dt_list     <- list()
+
+for (ct in names(rankings_per_celltype)) {
+  ranked_list <- rankings_per_celltype[[ct]]
+
+  set.seed(42)
+  gsea_res <- fgsea(
+    pathways = pathways_filtered,
+    stats    = ranked_list,
+    minSize  = GSEA_MIN_SIZE,
+    maxSize  = GSEA_MAX_SIZE,
+    nPermSimple = 100000
+  )
+  gsea_res$cell_type <- ct
+  gsea_results_all[[ct]] <- gsea_res
+
+  top_100 <- gsea_res %>%
+    filter(NES > 0, padj < 0.05) %>%
+    arrange(pval) %>%
+    head(100) %>%
+    select(pathway, pval, padj, ES, NES, size, leadingEdge) %>%
+    mutate(
+      pathway_short = str_trunc(pathway, 60),
+      leadingEdge   = sapply(leadingEdge, function(x) paste(head(x, 5), collapse = ", "))
+    ) %>%
+    select(pathway_short, pval, padj, ES, NES, size, leadingEdge)
+
+  gsea_dt_list[[ct]] <- htmltools::tagList(
+    htmltools::h3(paste0(ct, " — Top GSEA Results (NMD susceptible direction)")),
+    datatable(
+      top_100,
+      options   = list(pageLength = 10, scrollX = TRUE),
+      caption   = paste0("Top GSEA results — ", ct),
+      elementId = paste0("gsea_dt_", ct)
+    ) %>%
+      formatRound(columns = c("pval", "padj", "ES", "NES"), digits = 4)
+  )
+}
+
+gsea_combined     <- bind_rows(gsea_results_all)
+gsea_combined_pos <- gsea_combined %>% filter(NES > 0)
+
+gsea_significant <- gsea_combined_pos %>%
+  filter(padj < GSEA_FDR_THRESHOLD) %>%
+  arrange(padj)
+
+gsea_combined$leadingEdge <- sapply(gsea_combined$leadingEdge, paste, collapse = ", ")
+write_tsv(gsea_combined, OUTPUT_GSEA_ALL)
+
+if (nrow(gsea_significant) > 0) {
+  gsea_significant$leadingEdge <- sapply(gsea_significant$leadingEdge, paste, collapse = ", ")
+  write_tsv(gsea_significant, OUTPUT_GSEA_SIG)
+}
+
+# Define GSEA terms the first time these tables appear.
+cat("GSEA column definitions:\n")
+cat("  NES         = normalized enrichment score (sign = direction; NES > 0 = enriched in NMD-susceptible / Smg1i-up genes).\n")
+cat("  ES          = raw enrichment score.\n")
+cat("  pval / padj = enrichment p-value and BH-adjusted FDR.\n")
+cat("  size        = number of genes in the pathway after filtering.\n")
+cat("  leadingEdge = top genes driving the enrichment.\n\n")
+
+htmltools::tagList(gsea_dt_list)
+```
+
+## Pathway Sharing Across Cell Types
+
+We classify each enriched pathway (NES > 0, FDR < 0.05) by how many cell types it is
+significant in: **CT-specific** (exactly one cell type), **partial** (2-3 cell types),
+or **universal** (all 4 cell types). The three results chunks below report: (1) the
+overall classification across all pathways, (2) the shared pathways, and (3) the
+CT-specific pathways.
+
+### All Pathways: Sharing Classification
+
+```{r pathways-all}
+gsea_dt <- as.data.table(gsea_combined)
+FDR_CUT <- GSEA_FDR_THRESHOLD
+
+# Significance per row (NES > 0, consistent with the NMD-susceptible / Smg1i-up signature)
+gsea_dt[, is_sig := padj < FDR_CUT & NES > 0]
+
+# Number of cell types each pathway is significant in, and the classification
+pathway_n_ct <- gsea_dt[is_sig == TRUE,
+                        .(n_cts   = uniqueN(cell_type),
+                          cts_sig = paste(sort(unique(cell_type)), collapse = ",")),
+                        by = pathway]
+pathway_n_ct[, category := fcase(
+  n_cts == 1,      "CT-specific",
+  n_cts %in% 2:3,  "Partial",
+  n_cts == 4,      "Universal"
+)]
+
+cat("Pathway-sharing term definitions:\n")
+cat("  n_cts    = number of cell types in which the pathway is significant (FDR < 0.05, NES > 0).\n")
+cat("  category = CT-specific (1 CT), Partial (2-3 CTs), or Universal (all 4 CTs).\n\n")
+
+cat(sprintf("Total enriched pathways (NES > 0, FDR < %.2f) in >=1 cell type: %d.\n\n",
+            FDR_CUT, nrow(pathway_n_ct)))
+
+cat("Pathways per sharing category:\n")
+print(pathway_n_ct[, .N, by = category])
+
+cat("\nSignificant pathway counts per cell type (NES > 0, FDR < 0.05):\n")
+print(gsea_dt[is_sig == TRUE, .(n_pathways = .N), by = cell_type][order(cell_type)])
+
+# Save classification + all significant pathway rows
+OUT_GSEA_DIR <- "/udd/reyle/nmd_lungcells_2026/shortread_dge/gsea_classified"
+dir.create(OUT_GSEA_DIR, recursive = TRUE, showWarnings = FALSE)
+fwrite(pathway_n_ct, file.path(OUT_GSEA_DIR, "pathway_sharing_classification.csv"))
+fwrite(gsea_dt[is_sig == TRUE][order(cell_type, padj)],
+       file.path(OUT_GSEA_DIR, "all_significant_pathways.csv"))
+cat(sprintf("\nSaved classification and all-significant tables to %s.\n", OUT_GSEA_DIR))
+```
+
+### Shared Pathways (Significant in 2+ Cell Types)
+
+```{r pathways-shared}
+shared_pathways <- pathway_n_ct[category %in% c("Partial", "Universal")]
+cat(sprintf("Shared pathways (significant in 2+ cell types): %d.\n\n", nrow(shared_pathways)))
+
+# NES across cell types for each shared pathway
+shared_full <- gsea_dt[pathway %in% shared_pathways$pathway]
+shared_wide <- dcast(shared_full, pathway ~ cell_type, value.var = "NES", fill = NA)
+setDT(shared_wide)
+shared_wide <- merge(shared_wide,
+                     pathway_n_ct[, .(pathway, n_cts, category)],
+                     by = "pathway")
+setorder(shared_wide, -n_cts, pathway)
+
+cat("Universal pathways (significant in all 4 cell types):\n")
+print(shared_wide[category == "Universal"])
+
+cat("\nPartially shared pathways (top 25 by number of cell types):\n")
+print(shared_wide[category == "Partial"][order(-n_cts)][1:min(25, .N)])
+
+fwrite(shared_wide, file.path(OUT_GSEA_DIR, "shared_pathways_NES_matrix.csv"))
+```
+
+```{r leading edge for core shared pathways}
+library(data.table)
+gsea_dt <- as.data.table(gsea_combined)
+gsea_dt[, is_sig := padj < GSEA_FDR_THRESHOLD & NES > 0]
+
+# robustly turn leadingEdge (list-col OR collapsed string) into a character vector
+gsea_dt[, le_list := lapply(leadingEdge, function(x){
+  if (is.list(x)) unlist(x) else trimws(unlist(strsplit(as.character(x), "[,;]\\s*")))
+})]
+
+# pathways significant (NES>0, FDR<cut) in >= 3 cell types
+shared3 <- gsea_dt[is_sig == TRUE,
+                   .(n_cts = uniqueN(cell_type),
+                     cts   = paste(sort(unique(cell_type)), collapse = ",")),
+                   by = pathway][n_cts >= 3]
+cat(sprintf("Pathways significant in 3+ cell types: %d\n", nrow(shared3)))
+
+# ---- (1) per-pathway UNION of all leading-edge genes across the significant CTs ----
+le_union <- gsea_dt[is_sig == TRUE & pathway %in% shared3$pathway,
+                    .(leadingEdge_all = paste(sort(unique(unlist(le_list))), collapse = ", "),
+                      n_LE_genes      = uniqueN(unlist(le_list))),
+                    by = pathway]
+shared3_le <- merge(shared3, le_union, by = "pathway")[order(-n_cts, pathway)]
+setcolorder(shared3_le, c("pathway","n_cts","cts","n_LE_genes","leadingEdge_all"))
+fwrite(shared3_le, file.path(OUT_GSEA_DIR, "shared3plus_leadingedge_union.csv"))
+
+# ---- (2) per-cell-type leading edge for the same pathways (so you can see overlap) ----
+le_byct <- gsea_dt[is_sig == TRUE & pathway %in% shared3$pathway,
+                   .(NES = round(NES,2), padj = signif(padj,3),
+                     leadingEdge = sapply(le_list, paste, collapse = ", ")),
+                   by = .(pathway, cell_type)][order(pathway, cell_type)]
+fwrite(le_byct, file.path(OUT_GSEA_DIR, "shared3plus_leadingedge_byCT.csv"))
+
+# ---- (3) optional: core leading edge = genes in the leading edge of ALL significant CTs ----
+core_le <- gsea_dt[is_sig == TRUE & pathway %in% shared3$pathway][
+  , {
+      g <- table(unlist(le_list))
+      ncts <- shared3[pathway == .BY$pathway, n_cts]
+      data.table(core_LE = paste(sort(names(g)[g == ncts]), collapse = ", "),
+                 n_core  = sum(g == ncts))
+    }, by = pathway]
+shared3_le <- merge(shared3_le, core_le, by = "pathway", all.x = TRUE)
+
+# display (interactive, full strings scroll)
+DT::datatable(shared3_le,
+  options = list(pageLength = 25, scrollX = TRUE),
+  caption = "Pathways enriched in 3+ cell types: all leading-edge genes (union and CT-core)")
+```
+```{r more edge genes}
+library(data.table)
+target_paths <- shared3$pathway                     # the 3+ -CT pathways (3 here)
+
+# explode to one row per (pathway, cell_type, gene)
+le_long <- gsea_dt[is_sig == TRUE & pathway %in% target_paths,
+                   .(gene = unlist(le_list)), by = .(pathway, cell_type)]
+
+## ---- POOLED across the 3 pathways: each gene's CT count ----
+gene_ct <- le_long[, .(n_ct = uniqueN(cell_type),
+                       cts  = paste(sort(unique(cell_type)), collapse = ",")), by = gene]
+
+cat(sprintf("Pooled over %d shared pathways:\n", length(target_paths)))
+cat(sprintf("  Unique leading-edge genes (union):      %d\n", nrow(gene_ct)))
+cat(sprintf("  Convergent (in all 3 cell types):       %d\n", sum(gene_ct$n_ct == 3)))
+cat("  Genes by # cell types they appear in:\n")
+print(gene_ct[, .(n_genes = .N), by = n_ct][order(-n_ct)])
+
+cat("\nConvergent genes (leading edge in all 3 CTs):\n")
+print(sort(gene_ct[n_ct == 3]$gene))
+
+## ---- PER pathway: union size and core (all-CT) size ----
+per_path <- le_long[, {
+  nct <- uniqueN(cell_type); g <- table(gene)
+  .(n_ct = nct, union_genes = length(g), core_all_ct = sum(g == nct))
+}, by = pathway][order(-core_all_ct)]
+cat("\nPer pathway (union = all LE genes; core_all_ct = in every significant CT):\n")
+print(per_path)
+
+library(data.table)
+# le_long: one row per (pathway, cell_type, gene), significant pathways only
+sig_cells <- unique(le_long[, .(pathway, cell_type)])      # all significant pathway×CT combos
+n_full    <- nrow(sig_cells)                                # = 9 if each of 3 pathways is sig in all 3 CTs
+
+# sanity: is every pathway significant in the same 3 CTs?
+cat("Significant CTs per pathway:\n")
+print(le_long[, .(cts = paste(sort(unique(cell_type)), collapse=",")), by = pathway])
+cat(sprintf("\nTotal significant pathway x CT cells: %d\n", n_full))
+
+# strict: gene must be in the leading edge of EVERY (pathway, CT) cell
+gene_cov <- le_long[, .(n_cells = uniqueN(paste(pathway, cell_type))), by = gene]
+strict   <- gene_cov[n_cells == n_full]
+
+cat(sprintf("Genes in the leading edge of ALL %d cells (all 3 CTs in all 3 pathways): %d\n",
+            n_full, nrow(strict)))
+print(sort(strict$gene))
+
+# breakdown: how many of the 9 cells each gene covers
+cat("\nGenes by number of (pathway x CT) cells covered:\n")
+print(gene_cov[, .(n_genes = .N), by = n_cells][order(-n_cells)])
+```
+
+### CT-Specific Pathways (Significant in Exactly One Cell Type)
+
+```{r pathways-ct-specific}
+ct_specific_pathways <- pathway_n_ct[category == "CT-specific"]$pathway
+ct_spec_full <- gsea_dt[pathway %in% ct_specific_pathways][order(cell_type, padj)]
+
+cat(sprintf("CT-specific pathways (significant in exactly one cell type): %d.\n",
+            length(ct_specific_pathways)))
+
+for (ct_x in CT_DISPLAY_ORDER) {
+  sig_in_ct <- pathway_n_ct[category == "CT-specific" & cts_sig == ct_x]$pathway
+  if (length(sig_in_ct) == 0) {
+    cat(sprintf("\n--- %s: 0 CT-specific pathways ---\n", ct_x))
+    next
+  }
+  cat(sprintf("\n--- %s: %d CT-specific pathways (top 15 by FDR) ---\n", ct_x, length(sig_in_ct)))
+  top15 <- gsea_dt[cell_type == ct_x & pathway %in% sig_in_ct][order(padj)][1:min(15, .N)]
+  print(top15[, .(pathway, NES = round(NES, 3), padj = signif(padj, 3), size, leadingEdge)])
+}
+
+fwrite(ct_spec_full, file.path(OUT_GSEA_DIR, "ct_specific_pathways_full.csv"))
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

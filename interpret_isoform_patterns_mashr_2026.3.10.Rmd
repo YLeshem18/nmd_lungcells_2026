@@ -1,0 +1,740 @@
+---
+title: "Isoform-Level DIE: Pattern Interpretation"
+author: "Leshem, Yul"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: lumen
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+---
+
+Code location: `/udd/reyle/nmd_lungcells_2026/code/final/interpret_isoform_patterns_mashr_2026.3.10.Rmd`
+
+```{r setup, include=FALSE}
+options(bitmapType = "cairo")
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, dev = "png")
+
+```
+
+# Analysis Overview
+
+This report interprets isoform-proportion patterns to characterize NMD
+inhibition effects on transcript diversity. Four questions are addressed:
+
+- **Q1.** How does the number of detected isoforms per gene change under Smg1i?
+- **Q2.** How prevalent are dominant isoforms (>50% of gene CPM) under each condition?
+- **Q3.** What are the baseline (DMSO) proportions of NMD susceptible transcripts?
+- **Q6.** Which pathways are enriched among genes with high NMD output?
+
+NMD susceptible transcripts are defined as posterior mean logFC > 0 AND lfsr <
+0.05. Proportion calculations use raw normalized CPM from the DGEList.
+
+```{r config, include=FALSE}
+DATE_STAMP <- "2026.3.10"
+
+INPUT_DGELIST          <- "/udd/reyle/nmd_lungcells_2026/long_read/dge_isoform_longread_2026.3.3.rds"
+INPUT_DGELIST_FILTERED <- "/udd/reyle/nmd_lungcells_2026/long_read/dge_isoform_longread_filtered_2026.3.3.rds"
+
+INPUT_DGE_DIR    <- "/udd/reyle/nmd_lungcells_2026/long_read/mashr"
+DGE_FILE_PATTERN <- paste0("^nmd_mashr_die_.*_", gsub("\\.", "\\\\.", DATE_STAMP), "\\.csv$")
+
+OUTPUT_DIR  <- file.path("/udd/reyle/nmd_lungcells_2026/tmp/mashr_die_interpret")
+OUT_DIR_FIG <- "/udd/reyle/nmd_lungcells_2026/final_figures/lr_iso"
+dir.create(OUTPUT_DIR,  recursive = TRUE, showWarnings = FALSE)
+dir.create(OUT_DIR_FIG, recursive = TRUE, showWarnings = FALSE)
+
+OUTPUT_Q1      <- file.path(OUTPUT_DIR, paste0("mashr_isoform_q1_isoforms_per_gene_",    DATE_STAMP, ".tsv"))
+OUTPUT_Q2      <- file.path(OUTPUT_DIR, paste0("mashr_isoform_q2_dominant_isoforms_",    DATE_STAMP, ".tsv"))
+OUTPUT_Q3      <- file.path(OUTPUT_DIR, paste0("mashr_isoform_q3_upregulated_baseline_", DATE_STAMP, ".tsv"))
+OUTPUT_Q6_GSEA <- file.path(OUTPUT_DIR, paste0("mashr_isoform_q6_gsea_nmd_output_",      DATE_STAMP, ".tsv"))
+
+CPM_THRESHOLD          <- 0.25
+SIGNIFICANCE_THRESHOLD <- 0.05
+GSEA_MIN_SIZE          <- 15
+GSEA_MAX_SIZE          <- 500
+GSEA_SEED              <- 42  # re-seeded before fgsea() for reproducible nulls
+
+# 4 cell types only. Pipeline writes nmd_mashr_die_at2/lae/fb/mv_<date>.csv, so
+# the keys here are the lower-case file codes, mapped to display names.
+CELLTYPE_MAP     <- c("at2" = "AT2", "lae" = "LAE", "fb" = "FB", "mv" = "MV")
+CT_DISPLAY_ORDER <- c("AT2", "LAE", "FB", "MV")
+
+stopifnot("DGEList (unfiltered) not found" = file.exists(INPUT_DGELIST))
+stopifnot("DGEList (filtered) not found"   = file.exists(INPUT_DGELIST_FILTERED))
+stopifnot("DGE directory not found"        = dir.exists(INPUT_DGE_DIR))
+```
+
+<style>
+body { font-size: 16px; }
+p, li { font-size: 16px; line-height: 1.6; }
+</style>
+
+# Libraries
+
+```{r load-libs}
+library(tidyverse)
+library(data.table)
+library(DT)
+library(edgeR)
+
+# Bioconductor namespace masking guard
+rename <- dplyr::rename
+select <- dplyr::select
+filter <- dplyr::filter
+mutate <- dplyr::mutate
+first  <- dplyr::first
+count  <- dplyr::count
+
+# Fix RNG once (fgsea draws permutations; matches the short-read pipeline).
+set.seed(GSEA_SEED)
+```
+
+# Load Data
+
+## DGEList Objects And Normalized CPM
+
+```{r load-dgelist}
+dge_isoform  <- readRDS(INPUT_DGELIST)
+dge_filtered <- readRDS(INPUT_DGELIST_FILTERED)
+
+cat("Unfiltered:", nrow(dge_isoform),  "transcripts x", ncol(dge_isoform),  "samples\n")
+cat("Filtered:  ", nrow(dge_filtered), "transcripts x", ncol(dge_filtered), "samples\n")
+
+# Repair / harmonize cell-type column from sample names. Sample-name suffixes
+# still carry the original DD/AT codes (kept so they match the count columns);
+# parse them first, then relabel to display names AFTER matching:
+#   DD -> LAE, AT -> AT2 (DD_ALI / DO_ALI untouched, dropped downstream).
+fix_ct <- function(samples_df) {
+  samples_df$ct <- sub("^.*_(DD_ALI|DD|AT|DO|FB|MV)$", "\\1", samples_df$sample_name)
+  samples_df$ct <- ifelse(samples_df$ct == "DO", "DO_ALI", samples_df$ct)
+  samples_df$ct[samples_df$ct == "DD"] <- "LAE"
+  samples_df$ct[samples_df$ct == "AT"] <- "AT2"
+  samples_df
+}
+dge_isoform$samples  <- fix_ct(dge_isoform$samples)
+dge_filtered$samples <- fix_ct(dge_filtered$samples)
+
+cat("Cell types in unfiltered:", paste(sort(unique(dge_isoform$samples$ct)),  collapse = ", "), "\n")
+cat("Cell types in filtered:  ", paste(sort(unique(dge_filtered$samples$ct)), collapse = ", "), "\n")
+
+cpm_normalized <- cpm(dge_filtered, normalized = TRUE, log = FALSE)
+```
+
+## Calculate Isoform Proportions
+
+```{r calculate-proportions}
+sample_meta            <- dge_filtered$samples
+sample_meta$cpm_col_id <- rownames(sample_meta)
+
+cpm_long <- as.data.frame(cpm_normalized) %>%
+  mutate(transcript_id = dge_filtered$genes$txid) %>%
+  pivot_longer(cols = -transcript_id, names_to = "cpm_col_id", values_to = "cpm") %>%
+  left_join(sample_meta %>% select(cpm_col_id, sample_name, treatment, ct),
+            by = "cpm_col_id") %>%
+  rename(cell_type = ct)
+
+stopifnot("Sample metadata join failed" = sum(is.na(cpm_long$treatment)) == 0)
+
+cpm_long <- cpm_long %>%
+  left_join(dge_filtered$genes %>% select(txid, gene_id),
+            by = c("transcript_id" = "txid")) %>%
+  rename(gene_group_id = gene_id)
+
+# FILTER: restrict to the 4-cell-type universe (drops ALI) at the long-frame boundary.
+n_before <- nrow(cpm_long)
+cpm_long <- cpm_long %>% filter(cell_type %in% CT_DISPLAY_ORDER)
+cat(sprintf("FILTER: kept rows in {%s}.\n  Rows before: %d / Rows now: %d.\n",
+            paste(CT_DISPLAY_ORDER, collapse = ", "), n_before, nrow(cpm_long)))
+
+all_proportions <- cpm_long %>%
+  group_by(cell_type, treatment, cpm_col_id, gene_group_id) %>%
+  mutate(
+    gene_total_cpm     = sum(cpm),
+    isoform_proportion = cpm / gene_total_cpm,
+    isoform_proportion = ifelse(is.nan(isoform_proportion), 0, isoform_proportion),
+    n_isoforms         = n_distinct(transcript_id)
+  ) %>%
+  ungroup() %>%
+  rename(normalized_cpm = cpm)
+
+cat("Proportion data frame:", nrow(all_proportions), "rows\n")
+cat("Cell types:", paste(unique(all_proportions$cell_type), collapse = ", "), "\n")
+cat("Treatments:", paste(unique(all_proportions$treatment), collapse = ", "), "\n")
+
+```
+
+## Apply Abundance Filter
+
+```{r apply-filter}
+filtered_dict <- all_proportions %>%
+  group_by(cell_type, transcript_id) %>%
+  summarize(max_cpm = max(normalized_cpm), .groups = "drop") %>%
+  filter(max_cpm >= CPM_THRESHOLD)
+
+n_iso_before <- n_distinct(all_proportions$transcript_id)
+all_proportions <- all_proportions %>%
+  inner_join(filtered_dict %>% select(cell_type, transcript_id),
+             by = c("cell_type", "transcript_id"))
+
+cat("FILTER: abundance >= ", CPM_THRESHOLD, " CPM in either condition (per cell type).\n", sep = "")
+cat("  Unique isoforms before:", n_iso_before,
+    "/ after:", n_distinct(all_proportions$transcript_id), "\n")
+cat("  Rows:", nrow(all_proportions), "\n")
+cat("  Unique genes:   ", n_distinct(all_proportions$gene_group_id), "\n")
+```
+
+## Load DIE Results
+
+```{r load-die}
+dge_files <- list.files(INPUT_DGE_DIR, pattern = DGE_FILE_PATTERN, full.names = TRUE)
+cat("Loading", length(dge_files), "DIE files:\n"); print(basename(dge_files))
+
+# Cell type lives at parts[4]: nmd_mashr_die_<ct>_<date>.csv
+all_dge <- map_df(dge_files, ~{
+  df    <- read_csv(.x, show_col_types = FALSE)
+  parts <- str_split(basename(.x), "_")[[1]]
+  df$cell_type_file <- parts[4]
+  df
+})
+
+all_dge$cell_type <- CELLTYPE_MAP[all_dge$cell_type_file]
+
+# FILTER: drop rows with an unmapped cell-type code (stale at/dd keys would
+# map every row to NA and empty the report).
+n_before <- nrow(all_dge)
+all_dge  <- all_dge %>% filter(!is.na(cell_type))
+cat(sprintf("FILTER: dropped %d row(s) with an unmapped cell-type code.\n  Rows before: %d / Rows now: %d.\n",
+            n_before - nrow(all_dge), n_before, nrow(all_dge)))
+stopifnot(nrow(all_dge) > 0)
+
+cat("Columns present in DIE files:\n  ", paste(colnames(all_dge), collapse = ", "), "\n")
+
+if ("txid" %in% colnames(all_dge)) {
+  colnames(all_dge)[colnames(all_dge) == "txid"] <- "transcript_id"
+}
+
+# Resolve the gene-id column to a canonical `gene_id` (fail loudly if absent).
+gene_id_candidates <- c("gene_id", "gene_group_id", "gene", "ensembl_gene_id",
+                        "geneid", "ensembl_gene_id_version")
+gid <- intersect(gene_id_candidates, colnames(all_dge))
+if (length(gid) == 0) {
+  stop("No gene-id column found in DIE files. Columns are: ",
+       paste(colnames(all_dge), collapse = ", "))
+}
+if (!"gene_id" %in% colnames(all_dge)) {
+  all_dge$gene_id <- all_dge[[gid[1]]]
+  cat("Using '", gid[1], "' as gene_id.\n", sep = "")
+}
+
+all_dge$gene_symbol <- if ("hgnc_symbol" %in% colnames(all_dge)) {
+  ifelse(!is.na(all_dge$hgnc_symbol) & all_dge$hgnc_symbol != "",
+         all_dge$hgnc_symbol, all_dge$gene_id)
+} else {
+  all_dge$gene_id
+}
+
+cat("DIE results:", nrow(all_dge), "rows,",
+    length(unique(all_dge$cell_type)), "cell types\n")
+
+```
+
+## Build Gene Symbol Map
+
+```{r gene-symbol-map}
+gene_symbol_map <- all_dge %>%
+  filter(!is.na(hgnc_symbol), hgnc_symbol != "", !grepl("^ENSG", hgnc_symbol)) %>%
+  mutate(gene_id_no_version = str_replace(gene_id, "\\.\\d+$", "")) %>%
+  select(gene_id_no_version, hgnc_symbol) %>%
+  distinct()
+
+cat("Gene symbol map:", nrow(gene_symbol_map), "genes\n")
+```
+
+# Q1: Isoforms Per Gene
+
+```{r q1-isoforms-per-gene, fig.width=8, fig.height=5}
+isoforms_per_gene <- all_proportions %>%
+  filter(normalized_cpm > 0) %>%
+  group_by(cell_type, treatment, gene_group_id) %>%
+  summarize(n_isoforms_detected = n_distinct(transcript_id), .groups = "drop")
+
+isoform_comparison <- isoforms_per_gene %>%
+  pivot_wider(names_from = treatment, values_from = n_isoforms_detected, values_fill = 0) %>%
+  mutate(
+    delta_isoforms = Smg1i - DMSO,
+    more_tx_smg1i  = delta_isoforms > 0,
+    fewer_tx_smg1i = delta_isoforms < 0,
+    same_tx_count  = delta_isoforms == 0
+  )
+
+q1_summary <- isoform_comparison %>%
+  group_by(cell_type) %>%
+  summarize(
+    n_genes                  = n(),
+    mean_dmso                = mean(DMSO),
+    mean_smg1i               = mean(Smg1i),
+    mean_delta               = mean(delta_isoforms),
+    genes_with_more_tx_smg1i = sum(more_tx_smg1i),
+    pct_more_tx_smg1i        = 100 * sum(more_tx_smg1i) / n(),
+    .groups = "drop"
+  )
+
+datatable(q1_summary,
+          caption = "Average Isoforms Per Gene: DMSO Vs Smg1i") %>%
+  formatRound(columns = c("mean_dmso", "mean_smg1i", "mean_delta",
+                          "pct_more_tx_smg1i"), digits = 2)
+
+category_summary <- isoform_comparison %>%
+  mutate(category = case_when(
+    more_tx_smg1i  ~ "More In Smg1i",
+    fewer_tx_smg1i ~ "Fewer In Smg1i",
+    same_tx_count  ~ "Unchanged"
+  )) %>%
+  count(cell_type, category) %>%
+  filter(category != "Unchanged")
+
+category_summary$cell_type <- factor(category_summary$cell_type, levels = CT_DISPLAY_ORDER)
+
+p1 <- ggplot(category_summary, aes(x = cell_type, y = n, fill = category)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("More In Smg1i" = "steelblue", "Fewer In Smg1i" = "coral")) +
+  labs(title = "Genes With Changed Transcript Counts (Smg1i Vs DMSO)",
+       x = "Cell Type", y = "Number Of Genes", fill = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top",
+        plot.title      = element_text(face = "bold"))
+
+ggsave(file.path(OUT_DIR_FIG, paste0("q1_isoform_count_change_", DATE_STAMP, ".png")),
+       p1, width = 8, height = 5, dpi = 300, bg = "white")
+
+print(p1)
+write_tsv(isoform_comparison, OUTPUT_Q1)
+
+```
+
+# Q2: Dominant Isoforms
+
+A gene is counted as having a "dominant isoform" only if a single transcript
+exceeds 50% of total gene CPM in **every** sample of that cell type +
+treatment combination. Genes with fewer than 3 detected isoforms are excluded.
+
+```{r q2-dominant-isoforms, fig.width=8, fig.height=5}
+isoform_props <- all_proportions %>%
+  filter(normalized_cpm > 0) %>%
+  select(cell_type, treatment, cpm_col_id, gene_group_id, transcript_id, isoform_proportion)
+
+genes_with_3plus_isoforms <- isoform_props %>%
+  group_by(cell_type, treatment, gene_group_id) %>%
+  summarize(n_isoforms = n_distinct(transcript_id), .groups = "drop") %>%
+  filter(n_isoforms >= 3)
+
+isoform_props <- isoform_props %>%
+  semi_join(genes_with_3plus_isoforms, by = c("cell_type", "treatment", "gene_group_id"))
+
+dominant_genes <- isoform_props %>%
+  group_by(cell_type, treatment, gene_group_id, transcript_id) %>%
+  summarize(n_samples            = n(),
+            n_dominant_samples   = sum(isoform_proportion > 0.5),
+            mean_proportion      = mean(isoform_proportion),
+            .groups = "drop") %>%
+  mutate(is_dominant_all_samples = n_dominant_samples == n_samples & n_samples > 0) %>%
+  group_by(cell_type, treatment, gene_group_id) %>%
+  summarize(n_isoforms          = n(),
+            has_dominant_isoform = any(is_dominant_all_samples),
+            max_mean_proportion  = max(mean_proportion),
+            .groups = "drop")
+
+q2_summary <- dominant_genes %>%
+  group_by(cell_type, treatment) %>%
+  summarize(n_genes              = n(),
+            n_with_dominant      = sum(has_dominant_isoform),
+            pct_with_dominant    = 100 * n_with_dominant / n_genes,
+            mean_top_proportion  = mean(max_mean_proportion),
+            .groups = "drop")
+
+q2_summary$cell_type <- factor(q2_summary$cell_type, levels = CT_DISPLAY_ORDER)
+
+p2 <- ggplot(q2_summary, aes(x = cell_type, y = pct_with_dominant, fill = treatment)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("DMSO" = "gray70", "Smg1i" = "steelblue")) +
+  labs(title    = "Genes With Dominant Isoform (>50% In All Samples)",
+       subtitle = "Fraction of >=3-isoform genes with one transcript dominant in all samples",
+       x = "Cell Type", y = "% Of Genes", fill = "Treatment") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top",
+        plot.title      = element_text(face = "bold"),
+        plot.subtitle   = element_text(color = "grey40"))
+
+ggsave(file.path(OUT_DIR_FIG, paste0("q2_dominant_isoforms_", DATE_STAMP, ".png")),
+       p2, width = 8, height = 5, dpi = 300, bg = "white")
+
+print(p2)
+write_tsv(q2_summary, OUTPUT_Q2)
+```
+
+# Q3: Baseline Proportions Of NMD Susceptible Transcripts
+
+## Identify NMD Susceptible Transcripts
+
+```{r q3-identify}
+nmd_responsive <- all_dge %>%
+  filter(logFC > 0, adj.P.Val < SIGNIFICANCE_THRESHOLD) %>%
+  select(cell_type, transcript_id, logFC, adj.P.Val)
+
+cat("NMD susceptible transcripts (lfsr < 0.05) by cell type:\n")
+print(nmd_responsive %>% group_by(cell_type) %>% summarize(n = n(), .groups = "drop"))
+cat("\nUnique transcripts:", n_distinct(nmd_responsive$transcript_id), "\n")
+
+```
+
+## Baseline (DMSO) Proportions
+
+```{r q3-baseline}
+baseline_proportions <- all_proportions %>%
+  filter(treatment == "DMSO") %>%
+  inner_join(nmd_responsive, by = c("cell_type", "transcript_id")) %>%
+  select(cell_type, cpm_col_id, gene_group_id, transcript_id,
+         normalized_cpm, isoform_proportion, n_isoforms, logFC, adj.P.Val)
+
+coverage_summary <- nmd_responsive %>%
+  select(cell_type, transcript_id) %>% distinct() %>%
+  left_join(
+    baseline_proportions %>% select(cell_type, transcript_id) %>% distinct() %>%
+      mutate(has_baseline = TRUE),
+    by = c("cell_type", "transcript_id")
+  ) %>%
+  group_by(cell_type) %>%
+  summarize(n_nmd_susceptible = n(),
+            n_with_baseline   = sum(has_baseline, na.rm = TRUE),
+            pct_coverage      = 100 * n_with_baseline / n(),
+            .groups = "drop")
+
+cat("Baseline coverage:\n")
+print(coverage_summary)
+
+transcript_summary <- baseline_proportions %>%
+  group_by(cell_type, transcript_id, gene_group_id, logFC, adj.P.Val) %>%
+  summarize(mean_cpm        = mean(normalized_cpm),
+            mean_proportion = mean(isoform_proportion),
+            n_samples       = n(),
+            n_zero_samples  = sum(normalized_cpm == 0),
+            .groups = "drop") %>%
+  mutate(is_zero_all  = n_zero_samples == n_samples,
+         is_low       = mean_cpm > 0 & mean_cpm < 0.1,
+         is_expressed = mean_cpm >= 0.1)
+
+q3_summary <- transcript_summary %>%
+  group_by(cell_type) %>%
+  summarize(
+    n_genes              = n_distinct(gene_group_id),
+    n_transcripts        = n(),
+    n_zero_dmso          = sum(is_zero_all),
+    n_low_dmso           = sum(is_low),
+    n_expressed_dmso     = sum(is_expressed),
+    pct_zero             = 100 * n_zero_dmso / n(),
+    pct_low              = 100 * n_low_dmso  / n(),
+    mean_baseline_cpm    = mean(mean_cpm[mean_cpm > 0]),
+    median_baseline_cpm  = median(mean_cpm[mean_cpm > 0]),
+    mean_baseline_prop   = mean(mean_proportion),
+    median_baseline_prop = median(mean_proportion),
+    pct_minor_isoforms   = 100 * sum(mean_proportion < 0.5) / n(),
+    pct_very_minor       = 100 * sum(mean_proportion < 0.1) / n(),
+    mean_logFC           = mean(logFC),
+    .groups = "drop"
+  )
+
+knitr::kable(q3_summary, digits = 2,
+             caption = "NMD Susceptible Transcripts: Baseline DMSO Expression")
+
+write_tsv(baseline_proportions, OUTPUT_Q3)
+```
+
+## All Isoforms — Proportion Vs Expression In DMSO
+
+```{r q3-all-iso, fig.width=8, fig.height=5}
+all_dmso_proportions <- all_proportions %>%
+  filter(treatment == "DMSO") %>%
+  group_by(transcript_id, gene_group_id) %>%
+  summarize(mean_cpm        = mean(normalized_cpm),
+            mean_proportion = mean(isoform_proportion),
+            .groups = "drop") %>%
+  filter(mean_cpm > 0)
+
+p_all <- ggplot(all_dmso_proportions, aes(x = mean_cpm, y = mean_proportion)) +
+  geom_point(alpha = 0.3, size = 0.5, color = "gray40") +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = 0.1, linetype = "dashed", color = "orange") +
+  scale_x_log10() +
+  labs(title    = "All Isoforms — Proportion Vs Expression In DMSO",
+       subtitle = "Lines: 50% (red), 10% (orange)",
+       x = "Mean Normalized CPM In DMSO (log10)",
+       y = "Mean Isoform Proportion In DMSO") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(color = "grey40"))
+
+ggsave(file.path(OUT_DIR_FIG, paste0("q3_all_iso_dmso_", DATE_STAMP, ".png")),
+       p_all, width = 8, height = 5, dpi = 300, bg = "white")
+
+print(p_all)
+
+```
+
+## NMD Susceptible — Proportion Vs Expression In DMSO
+
+```{r q3-nmd-dmso, fig.width=8, fig.height=5}
+nmd_dmso_proportions <- baseline_proportions %>%
+  group_by(transcript_id, gene_group_id) %>%
+  summarize(mean_cpm        = mean(normalized_cpm),
+            mean_proportion = mean(isoform_proportion),
+            .groups = "drop") %>%
+  filter(mean_cpm > 0)
+
+p_nmd <- ggplot(nmd_dmso_proportions, aes(x = mean_cpm, y = mean_proportion)) +
+  geom_point(alpha = 0.4, size = 0.8, color = "gray70") +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = 0.1, linetype = "dashed", color = "orange") +
+  scale_x_log10() +
+  labs(title    = "NMD Susceptible Isoforms — Proportion Vs Expression In DMSO",
+       subtitle = "Lines: 50% (red), 10% (orange)",
+       x = "Mean Normalized CPM In DMSO (log10)",
+       y = "Mean Isoform Proportion In DMSO") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(color = "grey40"))
+
+ggsave(file.path(OUT_DIR_FIG, paste0("q3_nmd_dmso_", DATE_STAMP, ".png")),
+       p_nmd, width = 8, height = 5, dpi = 300, bg = "white")
+
+print(p_nmd)
+```
+
+## NMD Susceptible — DMSO Vs Smg1i
+
+```{r q3-dmso-vs-smg1i, fig.width=8, fig.height=5}
+nmd_dmso_data  <- nmd_dmso_proportions %>% mutate(treatment = "DMSO")
+
+nmd_smg1i_data <- all_proportions %>%
+  filter(treatment == "Smg1i") %>%
+  inner_join(nmd_responsive, by = c("cell_type", "transcript_id")) %>%
+  group_by(transcript_id, gene_group_id) %>%
+  summarize(mean_cpm        = mean(normalized_cpm),
+            mean_proportion = mean(isoform_proportion),
+            .groups = "drop") %>%
+  filter(mean_cpm > 0) %>%
+  mutate(treatment = "Smg1i")
+
+nmd_combined_data <- bind_rows(nmd_dmso_data, nmd_smg1i_data)
+
+p_compare <- ggplot(nmd_combined_data,
+                    aes(x = mean_cpm, y = mean_proportion, color = treatment)) +
+  geom_point(alpha = 0.4, size = 0.8) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "black") +
+  geom_hline(yintercept = 0.1, linetype = "dashed", color = "gray50") +
+  scale_x_log10() +
+  scale_color_manual(values = c("DMSO" = "gray70", "Smg1i" = "steelblue")) +
+  labs(title    = "NMD Susceptible Isoforms — DMSO Vs Smg1i",
+       subtitle = "Lines: 50% (black), 10% (gray)",
+       x = "Mean Normalized CPM (log10)",
+       y = "Isoform Proportion",
+       color = "Treatment") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top",
+        plot.title      = element_text(face = "bold"),
+        plot.subtitle   = element_text(color = "grey40"))
+
+ggsave(file.path(OUT_DIR_FIG, paste0("q3_nmd_dmso_vs_smg1i_", DATE_STAMP, ".png")),
+       p_compare, width = 8, height = 5, dpi = 300, bg = "white")
+
+print(p_compare)
+
+```
+
+# Q6: Pathway Enrichment Of NMD Output
+
+Genes are ranked by `pct_to_nmd` — the fraction of each gene's transcriptional
+output (mean Smg1i CPM summed across its isoforms) that goes to NMD susceptible
+isoforms. Genes with no NMD susceptible isoforms get a score of 0. fgsea then
+asks which pathways concentrate at the top of this ranking.
+
+```{r q6-build-pct-to-nmd}
+nmd_responsive_set <- nmd_responsive %>%
+  select(cell_type, transcript_id) %>%
+  distinct() %>%
+  mutate(is_nmd_responsive = TRUE)
+
+# Per-isoform mean Smg1i CPM, tagged with NMD susceptible status
+smg1i_expression <- all_proportions %>%
+  filter(treatment == "Smg1i") %>%
+  group_by(cell_type, gene_group_id, transcript_id) %>%
+  summarize(mean_cpm = mean(normalized_cpm), .groups = "drop") %>%
+  left_join(nmd_responsive_set, by = c("cell_type", "transcript_id")) %>%
+  mutate(is_nmd_responsive = replace_na(is_nmd_responsive, FALSE))
+
+# Per-gene NMD output share
+gene_nmd_output <- smg1i_expression %>%
+  group_by(cell_type, gene_group_id) %>%
+  summarize(total_output    = sum(mean_cpm),
+            nmd_output      = sum(mean_cpm[is_nmd_responsive]),
+            has_nmd_isoform = any(is_nmd_responsive),
+            .groups = "drop") %>%
+  filter(has_nmd_isoform, total_output > 0) %>%
+  mutate(pct_to_nmd          = 100 * nmd_output / total_output,
+         gene_id_no_version  = str_replace(gene_group_id, "\\.\\d+$", "")) %>%
+  left_join(gene_symbol_map, by = "gene_id_no_version") %>%
+  select(-gene_id_no_version)
+```
+
+```{r q6-setup}
+if (!require("fgsea",   quietly = TRUE)) BiocManager::install("fgsea")
+if (!require("msigdbr", quietly = TRUE)) install.packages("msigdbr")
+library(fgsea); library(msigdbr); library(htmltools)
+
+```
+
+```{r q6-load-genesets}
+msigdb_h        <- msigdbr(species = "Homo sapiens", collection = "H")
+msigdb_bp       <- msigdbr(species = "Homo sapiens", collection = "C5", subcollection = "GO:BP")
+msigdb_kegg     <- msigdbr(species = "Homo sapiens", collection = "C2", subcollection = "CP:KEGG_LEGACY")
+msigdb_reactome <- msigdbr(species = "Homo sapiens", collection = "C2", subcollection = "CP:REACTOME")
+
+all_genesets <- bind_rows(
+  msigdb_h        %>% mutate(collection = "Hallmark"),
+  msigdb_bp       %>% mutate(collection = "GO_BP"),
+  msigdb_kegg     %>% mutate(collection = "KEGG"),
+  msigdb_reactome %>% mutate(collection = "Reactome")
+)
+
+pathways <- all_genesets %>% split(x = .$gene_symbol, f = .$gs_name)
+
+# FILTER: keep only gene sets within the GSEA size window.
+n_pathways_before <- length(pathways)
+pathways_filtered <- pathways[
+  sapply(pathways, length) >= GSEA_MIN_SIZE &
+  sapply(pathways, length) <= GSEA_MAX_SIZE
+]
+cat(sprintf("FILTER: gene sets restricted to [%d, %d] genes.\n  Sets before: %d / Sets now: %d.\n",
+            GSEA_MIN_SIZE, GSEA_MAX_SIZE, n_pathways_before, length(pathways_filtered)))
+```
+
+```{r q6-prepare-rankings}
+MIN_NMD_GENES             <- 100
+ranked_lists_per_celltype <- list()
+
+for (ct in unique(gene_nmd_output$cell_type)) {
+  all_genes_ct <- smg1i_expression %>%
+    filter(cell_type == ct) %>%
+    group_by(gene_group_id) %>%
+    summarize(total_output = sum(mean_cpm), .groups = "drop") %>%
+    mutate(gene_id_no_version = str_replace(gene_group_id, "\\.\\d+$", "")) %>%
+    left_join(gene_symbol_map, by = "gene_id_no_version")
+
+  genes_with_nmd <- gene_nmd_output %>%
+    filter(cell_type == ct) %>%
+    select(hgnc_symbol, pct_to_nmd)
+
+  ranked_data <- all_genes_ct %>%
+    left_join(genes_with_nmd, by = "hgnc_symbol") %>%
+    mutate(pct_to_nmd = replace_na(pct_to_nmd, 0)) %>%
+    filter(!is.na(hgnc_symbol), hgnc_symbol != "", !str_detect(hgnc_symbol, "^ENSG")) %>%
+    group_by(hgnc_symbol) %>%
+    slice_max(order_by = pct_to_nmd, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    arrange(desc(pct_to_nmd))
+
+  ranked_lists_per_celltype[[as.character(ct)]] <- setNames(
+    ranked_data$pct_to_nmd, ranked_data$hgnc_symbol
+  )
+  cat(as.character(ct),
+      "- Genes:", length(ranked_lists_per_celltype[[as.character(ct)]]),
+      "| With NMD signal:", sum(ranked_data$pct_to_nmd > 0), "\n")
+}
+
+```
+
+```{r q6-run-gsea, results='asis'}
+gsea_results_all <- list()
+table_num        <- 1
+
+for (ct in names(ranked_lists_per_celltype)) {
+  cat("###", ct, "\n\n")
+  ranked_list         <- ranked_lists_per_celltype[[ct]]
+  n_genes_with_signal <- sum(ranked_list > 0)
+
+  if (n_genes_with_signal < MIN_NMD_GENES) {
+    cat("**Skipping GSEA** — insufficient NMD signal (", n_genes_with_signal, "genes)\n\n")
+    next
+  }
+
+  set.seed(GSEA_SEED)  # reproducible fgsea permutation null
+  gsea_res <- fgsea(pathways = pathways_filtered, stats = ranked_list,
+                    minSize  = GSEA_MIN_SIZE, maxSize = GSEA_MAX_SIZE)
+
+  gsea_res$cell_type     <- ct
+  gsea_results_all[[ct]] <- gsea_res
+  cat("Pathways with FDR < 0.05:", sum(gsea_res$padj < 0.05, na.rm = TRUE), "\n\n")
+
+  top_100 <- gsea_res %>%
+    arrange(pval) %>%
+    head(100) %>%
+    mutate(pathway_short = str_trunc(pathway, 60),
+           leadingEdge   = sapply(leadingEdge, function(x) paste(head(x, 5), collapse = ", "))) %>%
+    select(pathway_short, pval, padj, ES, NES, size, leadingEdge)
+
+  dt <- datatable(
+    top_100,
+    options = list(pageLength = 10, scrollX = TRUE),
+    caption = paste0("Table ", table_num, ". GSEA Results — ", ct)
+  ) %>%
+    formatRound(columns = c("pval", "padj", "ES", "NES"), digits = 4)
+
+  print(htmltools::tagList(dt))
+  cat("\n\n")
+  table_num <- table_num + 1
+}
+
+if (length(gsea_results_all) > 0) {
+  gsea_combined <- bind_rows(gsea_results_all)
+  gsea_combined$leadingEdge <- sapply(gsea_combined$leadingEdge, paste, collapse = ", ")
+  write_tsv(gsea_combined, OUTPUT_Q6_GSEA)
+} else {
+  gsea_combined <- tibble()
+}
+```
+
+# Key Findings
+
+```{r findings}
+cat("**Q1: Isoform Diversity**\n")
+cat("- Mean change in detected isoforms per gene:",
+    round(mean(q1_summary$mean_delta), 2), "\n")
+cat("- Mean fraction of genes with more isoforms in Smg1i:",
+    round(mean(q1_summary$pct_more_tx_smg1i), 1), "%\n\n")
+
+cat("**Q2: Dominant Isoforms**\n")
+cat("- Mean fraction of genes with a dominant isoform:",
+    round(mean(q2_summary$pct_with_dominant), 1), "%\n\n")
+
+cat("**Q3: NMD Target Characteristics**\n")
+cat("- Median baseline proportion across cell types:",
+    round(mean(q3_summary$median_baseline_prop), 3), "\n")
+cat("- Mean fraction of NMD targets that are very minor isoforms (<10%):",
+    round(mean(q3_summary$pct_very_minor), 1), "%\n\n")
+
+if (exists("gsea_combined") && nrow(gsea_combined) > 0) {
+  cat("**Q6: GSEA**\n")
+  cat("- Total significant pathways across cell types (FDR < 0.05):",
+      sum(gsea_combined$padj < 0.05, na.rm = TRUE), "\n")
+}
+
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

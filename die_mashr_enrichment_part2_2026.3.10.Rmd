@@ -1,0 +1,245 @@
+---
+title: "Isoform-Level DIE: Functional Enrichment (Part 2)"
+author: "Leshem, Yul"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: lumen
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+---
+
+Code location: `/udd/reyle/nmd_lungcells_2026/code/final/die_mashr_enrichment_part2_2026.3.10.Rmd`
+
+# Overview
+
+This report tests pathway enrichment at the isoform level. Each gene is scored by
+its **largest-effect isoform** — the isoform with the largest absolute posterior-mean
+logFC — using that isoform's signed logFC as the gene's ranking statistic. All
+isoforms are considered (no NMD-susceptibility filter), and GSEA uses the standard
+(signed) score type.
+
+```{r setup, include=FALSE}
+options(bitmapType="cairo")
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE, cache=FALSE, dev="svg")
+```
+
+# Libraries
+
+```{r load-libs}
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+library(tidyverse)
+library(data.table)
+library(fgsea)
+library(msigdbr)
+library(htmltools)
+
+rename <- dplyr::rename; select <- dplyr::select; filter <- dplyr::filter
+mutate <- dplyr::mutate; count  <- dplyr::count
+
+# fgsea permutes for its null; fix the RNG once (matches short-read pipeline).
+set.seed(42)
+```
+
+```{r configuration}
+DATE_STAMP <- "2026.3.10"
+INPUT_DIE_DIR    <- "/udd/reyle/nmd_lungcells_2026/long_read/mashr"
+DIE_FILE_PATTERN <- paste0("^nmd_mashr_die_.*_", gsub("\\.", "\\\\.", DATE_STAMP), "\\.csv$")
+OUTPUT_DIR  <- file.path("/udd/reyle/nmd_lungcells_2026/tmp/mashr_die_enrichment")
+OUT_DIR_FIG <- "/udd/reyle/nmd_lungcells_2026/final_figures/lr_iso"
+dir.create(OUTPUT_DIR,  recursive=TRUE, showWarnings=FALSE)
+dir.create(OUT_DIR_FIG, recursive=TRUE, showWarnings=FALSE)
+
+CELLTYPE_MAP     <- c("at2"="AT2","lae"="LAE","fb"="FB","mv"="MV")
+CT_DISPLAY_ORDER <- c("AT2","LAE","FB","MV")
+GSEA_MIN_SIZE <- 15
+GSEA_MAX_SIZE <- 500
+GSEA_SEED     <- 42
+
+cat("Input DIE directory:", INPUT_DIE_DIR, "\n"); cat("Output directory:", OUTPUT_DIR, "\n")
+```
+
+# Load DIE Results
+
+```{r load-die}
+die_files <- list.files(INPUT_DIE_DIR, pattern = DIE_FILE_PATTERN, full.names = TRUE)
+cat("Loading", length(die_files), "DIE files:\n"); print(basename(die_files))
+
+all_dge <- map_df(die_files, ~{
+  df <- read_csv(.x, show_col_types = FALSE)
+  parts <- str_split(basename(.x), "_")[[1]]
+  df$cell_type_file <- parts[4]
+  df
+})
+all_dge$cell_type <- CELLTYPE_MAP[all_dge$cell_type_file]
+
+n_before <- nrow(all_dge)
+all_dge  <- all_dge %>% filter(!is.na(cell_type))
+cat(sprintf("FILTER: dropped %d row(s) with an unmapped cell-type code.\n  Rows before: %d / now: %d.\n",
+            n_before - nrow(all_dge), n_before, nrow(all_dge)))
+stopifnot(nrow(all_dge) > 0)
+
+cat("Columns present:\n  ", paste(colnames(all_dge), collapse=", "), "\n")
+if ("txid" %in% colnames(all_dge) && !"transcript_id" %in% colnames(all_dge))
+  colnames(all_dge)[colnames(all_dge)=="txid"] <- "transcript_id"
+
+gene_id_candidates <- c("gene_id","gene_group_id","gene","ensembl_gene_id","geneid","ensembl_gene_id_version")
+gid <- intersect(gene_id_candidates, colnames(all_dge))
+if (length(gid)==0) stop("No gene-id column. Columns: ", paste(colnames(all_dge), collapse=", "))
+if (!"gene_id" %in% colnames(all_dge)) { all_dge$gene_id <- all_dge[[gid[1]]]; cat("Using '",gid[1],"' as gene_id.\n",sep="") }
+
+if ("hgnc_symbol" %in% colnames(all_dge)) {
+  all_dge <- all_dge %>% mutate(gene_symbol = ifelse(!is.na(hgnc_symbol) & hgnc_symbol!="", hgnc_symbol, gene_id))
+} else if (!"gene_symbol" %in% colnames(all_dge)) all_dge$gene_symbol <- all_dge$gene_id
+
+cat("DIE data:", nrow(all_dge), "rows,", length(unique(all_dge$cell_type)), "cell types\n")
+cat("Rows per cell type:\n"); print(all_dge %>% count(cell_type, name="n_isoforms"))
+```
+
+# Load MSigDB Gene Sets
+
+```{r load-genesets}
+msigdb_h        <- msigdbr(species="Homo sapiens", collection="H")
+msigdb_bp       <- msigdbr(species="Homo sapiens", collection="C5", subcollection="GO:BP")
+msigdb_kegg     <- msigdbr(species="Homo sapiens", collection="C2", subcollection="CP:KEGG_LEGACY")
+msigdb_reactome <- msigdbr(species="Homo sapiens", collection="C2", subcollection="CP:REACTOME")
+all_genesets <- bind_rows(
+  msigdb_h %>% mutate(collection="Hallmark"),
+  msigdb_bp %>% mutate(collection="GO_BP"),
+  msigdb_kegg %>% mutate(collection="KEGG"),
+  msigdb_reactome %>% mutate(collection="Reactome"))
+print(all_genesets %>% group_by(collection) %>% summarize(n_genesets=n_distinct(gs_name), n_genes=n_distinct(gene_symbol), .groups="drop"))
+
+pathways <- all_genesets %>% split(x=.$gene_symbol, f=.$gs_name)
+n0 <- length(pathways)
+pathways_filtered <- pathways[sapply(pathways,length)>=GSEA_MIN_SIZE & sapply(pathways,length)<=GSEA_MAX_SIZE]
+cat(sprintf("FILTER: gene sets [%d,%d] genes. before %d / now %d.\n", GSEA_MIN_SIZE, GSEA_MAX_SIZE, n0, length(pathways_filtered)))
+rm(msigdb_h,msigdb_bp,msigdb_kegg,msigdb_reactome,all_genesets,pathways); gc()
+```
+
+# Build Per-Cell-Type Rankings (largest-effect isoform, all isoforms)
+
+For each cell type, each gene is represented by the isoform with the largest
+absolute posterior-mean logFC, ranked by that isoform's signed logFC.
+
+```{r prepare-rankings}
+rankings_per_celltype <- list()
+for (this_ct in CT_DISPLAY_ORDER) {
+  if (!this_ct %in% all_dge$cell_type) next
+  cat("Processing", this_ct, "...\n")
+  all_ct <- all_dge[all_dge$cell_type==this_ct, ]
+  ranked <- all_ct %>%
+    filter(!is.na(gene_symbol), gene_symbol!="", !is.na(logFC), !grepl("^ENSG", gene_symbol)) %>%
+    arrange(desc(abs(logFC))) %>%              # largest |logFC| first
+    distinct(gene_symbol, .keep_all = TRUE)    # one isoform per gene
+  rankings_per_celltype[[this_ct]] <- setNames(ranked$logFC, ranked$gene_symbol)
+  cat("  genes ranked:", length(rankings_per_celltype[[this_ct]]), "\n")
+}
+```
+
+# GSEA — Largest-Effect Isoform
+
+```{r gsea, results='asis'}
+cat("## GSEA: Largest-Effect Isoform Ranking\n\n")
+gsea_results <- list(); table_num <- 1
+for (this_ct in names(rankings_per_celltype)) {
+  cat("###", this_ct, "\n\n")
+  ranked_list <- rankings_per_celltype[[this_ct]]
+  cat("Genes ranked:", length(ranked_list), "\n\n")
+  set.seed(GSEA_SEED)
+  gsea_res <- fgsea(pathways=pathways_filtered, stats=ranked_list,
+                    minSize=GSEA_MIN_SIZE, maxSize=GSEA_MAX_SIZE)   # scoreType="std" (signed)
+  gsea_res$cell_type <- this_ct
+  gsea_results[[this_ct]] <- gsea_res
+  cat("Upregulated pathways (NES>0, FDR<0.05):", sum(gsea_res$NES>0 & gsea_res$padj<0.05, na.rm=TRUE), "\n")
+  cat("Upregulated pathways (NES>0, FDR<0.10):", sum(gsea_res$NES>0 & gsea_res$padj<0.10, na.rm=TRUE), "\n\n")
+  top <- gsea_res %>% filter(NES>0, padj<0.05) %>% arrange(pval) %>% head(100)
+  if (nrow(top)==0) { cat("No upregulated pathways with FDR<0.05\n\n"); table_num<-table_num+1; next }
+  disp <- top %>% mutate(pathway_short=str_trunc(pathway,60),
+                         leadingEdge=sapply(leadingEdge,function(x) paste(head(x,5),collapse=", "))) %>%
+    select(pathway_short,pval,padj,ES,NES,size,leadingEdge)
+  cat("**Table",table_num,". GSEA (largest-effect isoform) —",this_ct,"**\n\n")
+  print(knitr::kable(disp, digits=4, row.names=FALSE)); cat("\n\n"); table_num<-table_num+1
+}
+if (length(gsea_results)>0) {
+  gsea_combined <- bind_rows(gsea_results); gsea_pos <- gsea_combined %>% filter(NES>0)
+  cat("\n--- Summary (NES>0) ---\n")
+  cat("Total (FDR<0.05):", sum(gsea_pos$padj<0.05, na.rm=TRUE), "\n")
+  cat("Unique pathways:", length(unique(gsea_pos$pathway[gsea_pos$padj<0.05])), "\n")
+  cat("Total (FDR<0.10):", sum(gsea_pos$padj<0.10, na.rm=TRUE), "\n\n")
+  gsea_combined$leadingEdge <- sapply(gsea_combined$leadingEdge, paste, collapse=", ")
+  write_tsv(gsea_combined, file.path(OUTPUT_DIR, paste0("mashr_gsea_largest_effect_", DATE_STAMP, ".tsv")))
+}
+```
+
+# Cross-Cell-Type Pathway Comparison
+
+```{r cross-celltype-pathways, results='asis', fig.width=10, fig.height=8}
+cat("## Cross-Cell-Type Pathway Comparison\n\n")
+if (exists("gsea_pos")) {
+  for (fdr_thresh in c(0.05, 0.10)) {
+    pc <- gsea_pos %>% filter(padj<fdr_thresh) %>% count(pathway) %>% arrange(desc(n)) %>% filter(n>1)
+    cat("**Significant in 2+ cell types (FDR <", fdr_thresh, "):**", nrow(pc), "\n\n")
+    cat("**Significant in ALL 4 cell types (FDR <", fdr_thresh, "):**", sum(pc$n==4), "\n\n")
+    if (nrow(pc)>0) {
+      for (pw in head(pc$pathway,10)) {
+        det <- gsea_pos %>% filter(pathway==pw, padj<fdr_thresh) %>% select(cell_type,NES,padj) %>% arrange(cell_type)
+        cat("**", substr(pw,1,70), "** (", nrow(det), "cell types)\n\n")
+        print(knitr::kable(det, digits=4, row.names=FALSE)); cat("\n")
+      }
+      print(ggplot(pc %>% head(20), aes(x=reorder(substr(pathway,1,50),n), y=n, fill=factor(n))) +
+        geom_col() + coord_flip() + scale_fill_brewer(palette="Blues", direction=1) +
+        labs(title=paste0("Shared Pathways (FDR < ",fdr_thresh,")"), x=NULL, y="Number Of Cell Types", fill="Cell Types") +
+        theme_minimal(base_size=11) + theme(legend.position="none", plot.title=element_text(face="bold")))
+      cat("\n\n")
+    }
+  }
+  shared <- gsea_pos %>% filter(padj<0.10) %>% count(pathway) %>% filter(n>=2) %>% pull(pathway)
+  if (length(shared)>0) {
+    hd <- gsea_pos %>% filter(pathway %in% shared) %>% mutate(pathway_short=substr(pathway,1,50)) %>%
+      select(pathway_short, cell_type, NES) %>% pivot_wider(names_from=cell_type, values_from=NES, values_fill=0, values_fn=mean)
+    cat("**NES Heatmap: Shared Pathways (FDR < 0.10)**\n\n")
+    print(ggplot(hd %>% head(30) %>% pivot_longer(-pathway_short, names_to="cell_type", values_to="NES"),
+                 aes(cell_type, reorder(pathway_short,NES), fill=NES)) +
+      geom_tile(color="white") + scale_fill_gradient2(low="white", high="steelblue", midpoint=0, name="NES") +
+      labs(title="NES Heatmap Of Shared Pathways", x="Cell Type", y=NULL) +
+      theme_minimal(base_size=10) + theme(axis.text.y=element_text(size=7), plot.title=element_text(face="bold")))
+    cat("\n\n")
+  }
+}
+```
+
+# Summary
+
+```{r summary}
+cat("## Summary Of Key Findings\n\n**Functional Enrichment (NES>0), largest-effect isoform**\n\n")
+if (exists("gsea_results") && length(gsea_results)>0)
+  for (this_ct in names(gsea_results)) {
+    gd <- gsea_results[[this_ct]] %>% filter(NES>0)
+    cat("-", this_ct, ":", sum(gd$padj<0.05,na.rm=TRUE), "(FDR<0.05),", sum(gd$padj<0.10,na.rm=TRUE), "(FDR<0.10)\n")
+  }
+```
+
+```{r ct-specific}
+fdr_thresh <- 0.05
+sig_pw <- gsea_pos %>% filter(padj<fdr_thresh) %>% select(pathway, cell_type, NES, padj)
+ct_specific <- sig_pw %>% group_by(pathway) %>% mutate(n_ct=n_distinct(cell_type)) %>% ungroup() %>%
+  filter(n_ct==1) %>% arrange(cell_type, padj) %>% select(cell_type, pathway, NES, padj)
+cat("Cell-type-specific pathways (FDR <", fdr_thresh, "):\n")
+ct_specific %>% count(cell_type, name="n_specific") %>% print()
+for (ct in sort(unique(ct_specific$cell_type))) {
+  cat("\n**", ct, "-specific (", sum(ct_specific$cell_type==ct), "):**\n", sep="")
+  ct_specific %>% filter(cell_type==ct) %>% mutate(NES=round(NES,3), padj=signif(padj,2)) %>%
+    select(pathway,NES,padj) %>% as.data.frame() %>% print(row.names=FALSE)
+}
+knitr::kable(ct_specific, digits=c(0,0,3,4), caption=paste0("Cell-type-specific pathways (FDR < ",fdr_thresh,")"))
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

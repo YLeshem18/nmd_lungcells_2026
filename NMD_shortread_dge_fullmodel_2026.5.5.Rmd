@@ -1,0 +1,691 @@
+---
+title: "Short-Read Gene-Level DGE: limma-voom + mashr"
+author: "Leshem, Yul"
+date: "2026-03-10"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+    code_folding: hide
+    number_sections: true
+---
+
+Code location: `/udd/reyle/nmd_lungcells_2026/code/final/NMD_shortread_dge_fullmodel_2026.5.5.Rmd`
+
+# Overview
+
+This report produces gene-level differential expression results for the NMD-inhibitor
+(Smg1i) vs DMSO contrast across four primary human lung cell types (AT2, LAE, FB, MV),
+using short-read Salmon-quantified gene counts from the nf-core/rnaseq pipeline.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(bitmapType = "cairo")
+```
+
+# Libraries
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(edgeR)
+  library(limma)
+  library(DT)
+  library(EnhancedVolcano)
+  library(BiocParallel)
+  library(htmltools)
+  library(biomaRt)
+  library(dplyr)
+  library(ggrepel)
+  library(gridExtra)
+  library(parallel)
+  library(topGO)
+  library(org.Hs.eg.db)
+})
+
+# Bioconductor namespace masking guard
+select <- dplyr::select
+filter <- dplyr::filter
+rename <- dplyr::rename
+count  <- dplyr::count
+slice  <- dplyr::slice
+
+# Helper: volcano plot for a single topTable-style data frame
+plot_volcano <- function(df, design_name, coef_name) {
+  df <- df %>%
+    mutate(
+      negLogP = -log10(P.Value),
+      sig = ifelse(adj.P.Val < 0.05, "Significant", "Not Sig"),
+      label = ifelse(
+        is.na(external_gene_name) | external_gene_name == "",
+        ensembl_gene_id_version,
+        external_gene_name
+      )
+    )
+  top_hits <- df %>%
+    filter(sig == "Significant") %>%
+    arrange(P.Value) %>%
+    slice_head(n = 10)
+
+  ggplot(df, aes(x = logFC, y = negLogP)) +
+    geom_point(aes(color = sig), alpha = 0.6, size = 1.5) +
+    scale_color_manual(values = c("Significant" = "red", "Not Sig" = "gray")) +
+    geom_text_repel(data = top_hits, aes(label = label), size = 3,
+                    max.overlaps = Inf, box.padding = 0.3,
+                    point.padding = 0.3, segment.color = "grey50") +
+    labs(
+      title = paste0("Volcano Plot — ", design_name, "\nCoefficient: ", coef_name),
+      x = "log2 Fold Change",
+      y = expression(-log[10]("P-value"))
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(legend.position = "bottom",
+          plot.title = element_text(hjust = 0.5))
+}
+```
+
+# Step 1 — Load & Harmonize Data
+
+```{r load-data}
+out_dir          <- "/udd/repjc/RESEARCH/REUSABLE_CODE/rds/"
+OUT_DIR_FIGURES  <- "/udd/reyle/nmd_lungcells_2026/final_figures/sr"
+DATE_STAMP       <- "4.28.26"
+dir.create(OUT_DIR_FIGURES, recursive = TRUE, showWarnings = FALSE)
+
+gmap <- readRDS(file.path(out_dir, "gmap_ENSGv115_2025.08.12.rds"))
+
+raw_r_file <- "/proj/regeps/regep00/studies/ExternalCellLines/data/rnaseq/Randell_Lung_Cells_2025/results/nfcore-rnaseq/20250811_plus_20260129/star_salmon/salmon.merged.gene_counts_length_scaled.tsv"
+raw_r <- fread(raw_r_file)
+cat(sprintf("Loading raw count data. Dimensions: %d genes x %d sample columns.\n",
+            nrow(raw_r), ncol(raw_r) - 2L))
+
+names(raw_r) <- gsub("\\.", "_", names(raw_r))
+sample_cols       <- names(raw_r)[!names(raw_r) %in% c("gene_id", "gene_name")]
+sample_cols_clean <- gsub("_clean", "", sample_cols)
+sample_cols_clean <- gsub("_(x|y)$", "", sample_cols_clean)
+sample_cols_clean <- gsub("^AT2", "AT", sample_cols_clean)
+sample_cols_clean <- gsub("^DO",  "DO_ALI", sample_cols_clean)
+names(raw_r)[!names(raw_r) %in% c("gene_id", "gene_name")] <- sample_cols_clean
+cat("Cleaned count-matrix column names (stripped _clean/_x/_y, AT2->AT, DO->DO_ALI). Examples:\n  ",
+    paste(head(sample_cols_clean, 5), collapse = ", "), "\n")
+
+if (any(duplicated(names(raw_r)))) {
+  dup_names <- unique(names(raw_r)[duplicated(names(raw_r))])
+  n_before  <- ncol(raw_r)
+  raw_r <- raw_r[, !duplicated(names(raw_r)), with = FALSE]
+  cat(sprintf("FILTER: dropped %d duplicate-named column(s), keeping the FIRST of each (%s).\n  Columns before: %d / Columns now: %d. Verify these are true duplicates, not distinct reseq runs.\n",
+              n_before - ncol(raw_r), paste(dup_names, collapse = ", "), n_before, ncol(raw_r)))
+} else {
+  cat("No duplicate column names found.\n")
+}
+
+# ---- phenotypes ----
+phe1 <- fread("/udd/repjc/RESEARCH/NMD/NMD_Cell_Lines/pheno/FB_MV_pheno_2025.8.2.csv", data.table = FALSE)
+phe1$name <- sapply(strsplit(phe1$bam, "_"), function(x) x[4])
+phe1$name <- gsub("(DMSO|Smg1i)", "_\\1", phe1$name)
+phe1$name <- gsub("Clean", "", phe1$name)
+cat(sprintf("Loaded FB/MV phenotype sheet: %d samples.\n", nrow(phe1)))
+
+phe2 <- fread("/udd/repjc/RESEARCH/NMD/NMD_Cell_Lines/pheno/DD_DO_AT_pheno_2025.8.15.csv", data.table = FALSE)
+phe2$ct <- phe2$cell_type
+phe2$ct[phe2$ct == "LAE"] <- "DD"        # KEEP: sample names must match count-matrix columns
+phe2$ct[phe2$ct == "SAE"] <- "DO_ALI"
+phe2$ct[phe2$ct == "AT2"] <- "AT"        # KEEP: count columns were cleaned AT2->AT, so names must use AT
+phe2$name <- paste0(phe2$ct, phe2$sample_id, "_", phe2$treatment)
+phe2 <- phe2[, names(phe2)[!names(phe2) %in% "mapid"]]
+cat(sprintf("Loaded DD/DO/AT phenotype sheet: %d samples (LAE->DD, SAE->DO_ALI, AT2->AT for name matching).\n", nrow(phe2)))
+
+phe <- rbind(phe1, phe2)
+cat(sprintf("Combined phenotype table: %d samples total.\n", nrow(phe)))
+cat("Cell-type counts before ALI handling:\n"); print(table(phe$ct))
+
+# ---- ALI subjects: reclassify, then drop ----
+ali_subjects <- c("001V", "027U", "029T")
+dd_to_ali <- phe$ct == "DD" & phe$sample_id %in% ali_subjects
+phe$ct[dd_to_ali]   <- "DD_ALI"
+phe$name[dd_to_ali] <- gsub("^DD", "DD_ALI", phe$name[dd_to_ali])
+cat(sprintf("Reclassified %d submerged DD samples (donors %s) as DD_ALI.\n",
+            sum(dd_to_ali), paste(ali_subjects, collapse = ", ")))
+
+n_before <- nrow(phe)
+drop_ali <- phe$ct %in% c("DO_ALI", "DD_ALI")
+phe <- phe[!drop_ali, ]
+cat(sprintf("FILTER: DO_ALI and DD_ALI dropped (ALI/submerged cultures, not part of the 4-cell-type analysis).\n  Samples before: %d / Samples now: %d.\n",
+            n_before, nrow(phe)))
+
+# ---- analysis labels only: DD -> LAE, AT -> AT2 (sample NAMES keep DD/AT prefix to match counts) ----
+n_lae <- sum(phe$ct == "DD"); n_at2 <- sum(phe$ct == "AT")
+phe$ct[phe$ct == "DD"] <- "LAE"
+phe$ct[phe$ct == "AT"] <- "AT2"
+cat(sprintf("Relabeled cell types for analysis: DD -> LAE (%d samples), AT -> AT2 (%d samples).\n  Sample names keep their DD/AT prefixes to match count columns.\n",
+            n_lae, n_at2))
+
+# ---- match phenotype to count matrix ----
+keep_samples <- phe$name
+present <- keep_samples %in% names(raw_r)
+if (!all(present)) {
+  cat(sprintf("FILTER: %d phenotype sample(s) not found in count matrix, dropped: %s.\n",
+              sum(!present), paste(keep_samples[!present], collapse = ", ")))
+}
+raw_r <- raw_r[, c("gene_id", "gene_name", keep_samples[present]), with = FALSE]
+phe   <- phe[present, ]
+cat(sprintf("Matched phenotype to counts: %d of %d samples retained.\n", sum(present), length(present)))
+
+phe$ct        <- relevel(factor(phe$ct),        ref = "LAE")
+phe$treatment <- relevel(factor(phe$treatment), ref = "DMSO")
+cat("New sample names (cell type + donor ID + treatment). Examples:\n  ",
+    paste(head(phe$name, 5), collapse = ", "), "\n")
+cat(sprintf("Final design: %d samples; cell-type reference = %s, treatment reference = %s.\n",
+            nrow(phe), levels(phe$ct)[1], levels(phe$treatment)[1]))
+cat("Samples per cell type x treatment:\n"); print(table(phe$ct, phe$treatment))
+```
+
+# Step 2 — Format Gene Data
+
+```{r format-genes}
+raw_r           <- as.data.frame(raw_r)
+rownames(raw_r) <- raw_r$gene_id
+raw_r$gene_id   <- NULL
+n_samp <- ncol(raw_r) - ("gene_name" %in% colnames(raw_r))   # gene_name is an annotation col, not a sample
+cat(sprintf("Formatted gene matrix (gene IDs as row names). Dimensions: %d genes x %d samples.\n",
+            nrow(raw_r), n_samp))
+```
+
+# Step 3 — Build DGEList, Filter, Normalize
+
+```{r dgelist}
+common_sid <- intersect(colnames(raw_r), phe$name)
+cat(sprintf("Aligning counts and phenotype: %d samples shared.\n", length(common_sid)))
+raw_r <- raw_r[, common_sid]
+phe   <- phe[match(common_sid, phe$name), ]
+
+gmap <- gmap[match(rownames(raw_r), gmap$ensembl_gene_id_version), ]
+stopifnot(identical(gmap$ensembl_gene_id_version, rownames(raw_r)))
+
+dge <- DGEList(
+  counts  = raw_r,
+  samples = as.data.frame(phe),
+  genes   = gmap[, c("ensembl_gene_id_version", "hgnc_symbol", "external_gene_name")]
+)
+saveRDS(dge, file = "/udd/reyle/nmd_lungcells_2026/short_read/dge_shortread_gene_2026.3.2.rds")
+cat(sprintf("Built DGEList: %d genes x %d samples (before expression filter).\n", nrow(dge), ncol(dge)))
+
+design_all <- model.matrix(~ ct + treatment + ct:treatment, data = dge$samples)
+
+n_before <- nrow(dge)
+keep <- filterByExpr(dge, design = design_all, min.count = 5, min.total.count = 10, min.prop = 0)
+dge  <- dge[keep, , keep.lib.sizes = FALSE]
+cat(sprintf("FILTER: removed low-expression genes (filterByExpr; min.count=5, min.total.count=10).\n  Genes before: %d / Genes now: %d (%.1f%% kept).\n",
+            n_before, nrow(dge), 100 * nrow(dge) / n_before))
+
+dge <- calcNormFactors(dge, method = "TMM")
+cat(sprintf("Applied TMM normalization. Norm factors: range %.3f-%.3f, median %.3f.\n",
+            min(dge$samples$norm.factors), max(dge$samples$norm.factors), median(dge$samples$norm.factors)))
+
+saveRDS(dge, file = "/udd/reyle/nmd_lungcells_2026/short_read/dge_shortread_gene_filtered_2026.3.2.rds")
+cat(sprintf("Final filtered + normalized DGEList: %d samples, %d genes.\n", ncol(dge), nrow(dge)))
+```
+
+## Diagnostic PCA
+
+```{r pca}
+v <- voom(dge, design = design_all, plot = TRUE)
+cat(sprintf("Applied voom (log2-CPM, %d genes x %d samples). Running PCA for QC.\n", nrow(v$E), ncol(v$E)))
+
+pca     <- prcomp(t(v$E), scale. = TRUE)
+pca_df  <- as.data.frame(pca$x[, 1:2])
+var_exp <- round(100 * (pca$sdev^2 / sum(pca$sdev^2))[1:2], 1)
+
+pca_df$treatment <- dge$samples$treatment
+pca_df$ct        <- dge$samples$ct
+pca_df$sample_id <- dge$samples$sample_id
+
+p_pca <- ggplot(pca_df, aes(x = PC1, y = PC2, color = treatment, shape = ct)) +
+  geom_point(size = 3, alpha = 0.8) +
+  scale_color_manual(values = c("DMSO" = "orange", "Smg1i" = "purple")) +
+  labs(
+    title = "Pre-Adjustment PCA",
+    x = paste0("PC1 (", var_exp[1], "%)"),
+    y = paste0("PC2 (", var_exp[2], "%)")
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave(file.path(OUT_DIR_FIGURES, paste0("pca_plot_sr_", DATE_STAMP, ".png")),
+       p_pca, width = 10, height = 6, dpi = 300, bg = "white")
+
+print(p_pca)
+```
+
+# Step 4 — Fit Model
+
+```{r limma-fit}
+corfit <- duplicateCorrelation(v, design_all, block = dge$samples$sample_id)
+cat(sprintf("Estimated within-donor correlation using duplicateCorrelation (blocked on donor): consensus = %.4f.\n",
+            corfit$consensus.correlation))
+
+fit <- lmFit(v, design_all,
+             block       = dge$samples$sample_id,
+             correlation = corfit$consensus.correlation)
+fit <- eBayes(fit)
+
+plotSA(fit, main = "Residual SD vs Average Expression")
+
+colnames(fit$design)       <- make.names(colnames(fit$design))
+colnames(fit$coefficients) <- colnames(fit$design)
+
+contrast_matrix <- makeContrasts(
+  Smg1i_in_LAE = treatmentSmg1i,
+  Smg1i_in_AT2 = treatmentSmg1i + ctAT2.treatmentSmg1i,
+  Smg1i_in_FB  = treatmentSmg1i + ctFB.treatmentSmg1i,
+  Smg1i_in_MV  = treatmentSmg1i + ctMV.treatmentSmg1i,
+  levels = fit$design
+)
+
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2)
+cat("Fitted limma-voom model and defined per-cell-type contrasts: ",
+    paste(colnames(contrast_matrix), collapse = ", "), ".\n", sep = "")
+```
+
+# Step 5 — Per-Cell-Type Results: Tables and Volcano Plots
+
+```{r limma-results-extract}
+contrast_names <- c("Smg1i_in_AT2", "Smg1i_in_LAE", "Smg1i_in_FB", "Smg1i_in_MV")
+ct_labels      <- c("AT2", "LAE", "FB", "MV")
+
+limma_tt <- lapply(contrast_names, function(cn) {
+  topTable(fit2, coef = cn, number = Inf, sort.by = "none")
+})
+names(limma_tt) <- ct_labels
+
+cat(sprintf("Extracted per cell-type results (%d genes each). Significant genes (FDR < 0.05):\n",
+            nrow(limma_tt[[1]])))
+for (ct in ct_labels) {
+  n_sig <- sum(limma_tt[[ct]]$adj.P.Val < 0.05, na.rm = TRUE)
+  n_up  <- sum(limma_tt[[ct]]$adj.P.Val < 0.05 & limma_tt[[ct]]$logFC > 0, na.rm = TRUE)
+  cat(sprintf("  %s: %d total, %d up\n", ct, n_sig, n_up))
+}
+
+LIMMA_OUT_DIR <- "/udd/reyle/nmd_lungcells_2026/shortread_dge/limma"
+dir.create(LIMMA_OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+for (ct in ct_labels) {
+  tt_save <- limma_tt[[ct]][order(limma_tt[[ct]]$adj.P.Val), ]
+  fwrite(tt_save,
+         file = file.path(LIMMA_OUT_DIR,
+                          paste0("nmd_limma_dge_", tolower(ct), "_", DATE_STAMP, ".csv")))
+}
+cat(sprintf("Wrote %d per-cell-type limma result tables to %s.\n", length(ct_labels), LIMMA_OUT_DIR))
+```
+
+```{r limma-volcano-2x2, fig.width=10, fig.height=10}
+volcano_df <- bind_rows(lapply(ct_labels, function(ct) {
+  tt <- limma_tt[[ct]]
+  if (!"ensembl_gene_id_version" %in% colnames(tt)) tt$ensembl_gene_id_version <- rownames(tt)
+  if (!"external_gene_name" %in% colnames(tt)) {
+    tt$external_gene_name <- if ("hgnc_symbol" %in% colnames(tt)) tt$hgnc_symbol else NA_character_
+  }
+  tt$cell_type <- ct
+  tt[, c("ensembl_gene_id_version", "external_gene_name",
+         "logFC", "AveExpr", "t", "P.Value", "adj.P.Val", "B", "cell_type")]
+}))
+
+volcano_df <- volcano_df %>%
+  mutate(
+    negLogP = -log10(P.Value),
+    sig     = ifelse(adj.P.Val < 0.05, "Significant", "Not Sig"),
+    label   = ifelse(is.na(external_gene_name) | external_gene_name == "",
+                     ensembl_gene_id_version, external_gene_name)
+  )
+
+top_labels <- volcano_df %>%
+  filter(sig == "Significant") %>%
+  group_by(cell_type) %>%
+  arrange(P.Value, .by_group = TRUE) %>%
+  slice_head(n = 10) %>%
+  ungroup()
+
+cat(sprintf("Plotting volcanoes: %d total points, %d significant, labeling top 10 per cell type.\n",
+            nrow(volcano_df), sum(volcano_df$sig == "Significant")))
+
+volcano_df$cell_type <- factor(volcano_df$cell_type, levels = c("AT2", "LAE", "FB", "MV"))
+top_labels$cell_type <- factor(top_labels$cell_type, levels = c("AT2", "LAE", "FB", "MV"))
+
+p_limma_volcano <- ggplot(volcano_df, aes(x = logFC, y = negLogP)) +
+  geom_point(aes(color = sig), alpha = 0.5, size = 1.2) +
+  scale_color_manual(values = c("Significant" = "red", "Not Sig" = "gray70")) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", linewidth = 0.3) +
+  geom_text_repel(data = top_labels, aes(label = label),
+                  size = 2.8, max.overlaps = Inf, box.padding = 0.3,
+                  segment.color = "grey50") +
+  facet_wrap(~ cell_type, ncol = 2) +
+  labs(
+    title    = "Volcano Plots — Smg1i Vs DMSO",
+    subtitle = "Per-cell-type contrasts; red = adj.P.Val < 0.05, top 10 NMD susceptible labeled per panel",
+    x = "log2 Fold Change (Smg1i / DMSO)",
+    y = expression(-log[10]("P-value"))
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom",
+        strip.text      = element_text(face = "bold", size = 13),
+        plot.title      = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle   = element_text(color = "grey40", hjust = 0.5))
+
+ggsave(file.path(OUT_DIR_FIGURES, paste0("volcano_2x2_sr_", DATE_STAMP, ".png")),
+       p_limma_volcano, width = 10, height = 10, dpi = 300, bg = "white")
+
+print(p_limma_volcano)
+```
+
+```{r limma-top-tables}
+# Collect widgets in a tagList; return as the chunk's last value so knitr
+# registers JS deps and renders all four tables in the HTML output.
+cat("Building top 50 by FDR tables per cell type.\n")
+limma_dt_list <- list()
+
+for (ct in ct_labels) {
+  tt <- limma_tt[[ct]]
+  if (!"ensembl_gene_id_version" %in% colnames(tt)) tt$ensembl_gene_id_version <- rownames(tt)
+  if (!"external_gene_name" %in% colnames(tt)) {
+    tt$external_gene_name <- if ("hgnc_symbol" %in% colnames(tt)) tt$hgnc_symbol else NA_character_
+  }
+
+  tt_top <- tt %>%
+    dplyr::arrange(adj.P.Val) %>%
+    dplyr::select(ensembl_gene_id_version, external_gene_name,
+                  logFC, AveExpr, t, P.Value, adj.P.Val, B) %>%
+    head(50)
+
+  limma_dt_list[[ct]] <- htmltools::tagList(
+    htmltools::h3(paste0(ct, " — Top 50 By FDR")),
+    datatable(
+      tt_top,
+      options   = list(pageLength = 10, scrollX = TRUE),
+      caption   = paste0("Top 50 — ", ct),
+      elementId = paste0("limma_dt_", ct)
+    ) %>%
+      formatRound(columns  = c("logFC", "AveExpr", "t", "B"), digits = 3) %>%
+      formatSignif(columns = c("P.Value", "adj.P.Val"),       digits = 3)
+  )
+}
+
+htmltools::tagList(limma_dt_list)
+```
+
+# Step 6 — Adaptive Shrinkage Across Cell Types
+
+## 6.1 Setup
+
+```{r mashr-setup}
+if (!require("ashr",     quietly = TRUE)) install.packages("ashr")
+if (!require("mashr",    quietly = TRUE)) BiocManager::install("mashr")
+if (!require("reshape2", quietly = TRUE)) install.packages("reshape2")
+
+library(mashr)
+library(ashr)
+library(reshape2)
+```
+
+## 6.2 Extract Effect Sizes and Standard Errors
+
+```{r mashr-extract}
+bhat <- fit2$coefficients
+shat <- fit2$coefficients / fit2$t
+n_before <- nrow(shat)
+
+finite_rows <- apply(shat, 1, function(x) all(is.finite(x) & x > 0))
+bhat <- bhat[finite_rows, ]
+shat <- shat[finite_rows, ]
+cat(sprintf("FILTER: kept genes with a valid (finite, positive) SE in all %d cell types.\n  Genes before: %d / Genes now: %d (dropped %d).\n",
+            ncol(shat), n_before, nrow(bhat), n_before - sum(finite_rows)))
+
+stopifnot("bhat and shat dims must match" = identical(dim(bhat), dim(shat)))
+cat(sprintf("Effect-size and SE matrices ready for mashr: %d genes x %d cell types.\n",
+            nrow(bhat), ncol(bhat)))
+```
+
+## 6.3 Estimate Null Correlation
+
+```{r mashr-correlation}
+mash_data_init <- mash_set_data(Bhat = bhat, Shat = shat)
+m_1by1 <- mash_1by1(mash_data_init)
+strong <- get_significant_results(m_1by1, thresh = 0.05)
+cat(sprintf("Found %d strong signals (gene-by-gene ash, lfsr < 0.05) to learn data-driven covariance.\n",
+            length(strong)))
+
+set.seed(42)
+n_random   <- min(20000, nrow(bhat))
+random_idx <- sample(seq_len(nrow(bhat)), n_random)
+cat(sprintf("Sampling %d random genes (seed 42) to estimate the cross-cell-type null correlation.\n", n_random))
+mash_data_random <- mash_set_data(Bhat = bhat[random_idx, ],
+                                   Shat = shat[random_idx, ])
+Vhat <- estimate_null_correlation_simple(mash_data_random)
+cat("Estimated null correlation (Vhat):\n"); print(round(Vhat, 3))
+
+mash_data <- mash_set_data(Bhat = bhat, Shat = shat, V = Vhat)
+```
+
+## 6.4 Build Covariance Library
+
+```{r mashr-covariances}
+if (length(strong) >= 5) {
+  U_pca <- cov_pca(mash_data, npc = min(5, ncol(bhat) - 1), subset = strong)
+} else {
+  U_pca <- list()
+}
+U_c   <- cov_canonical(mash_data)
+U_all <- c(U_pca, U_c)
+cat(sprintf("Built covariance library: %d data-driven (PCA) + %d canonical = %d total.\n",
+            length(U_pca), length(U_c), length(U_all)))
+```
+
+## 6.5 Fit Model
+
+```{r mashr-fit}
+t_start <- Sys.time()
+m       <- mash(mash_data, Ulist = U_all, outputlevel = 2)
+cat(sprintf("Fitted mashr model in %.1f min.\n",
+            as.numeric(difftime(Sys.time(), t_start, units = "mins"))))
+
+pi_vals <- get_estimated_pi(m)
+cat("Estimated mixture weights (components > 1%):\n")
+print(round(sort(pi_vals[pi_vals > 0.01], decreasing = TRUE), 3))
+```
+
+## 6.6 Posterior Means and lfsr
+
+```{r mashr-results}
+pm   <- get_pm(m)
+lfsr <- get_lfsr(m)
+cat(sprintf("Posterior means and lfsr computed for %d genes x %d cell types.\n", nrow(pm), ncol(pm)))
+
+cat("--- Significant Genes (lfsr < 0.05) ---\n")
+n_sig_mash <- apply(lfsr, 2, function(x) sum(x < 0.05))
+print(n_sig_mash)
+
+cat("\n--- Shrunken (mashr) vs Unshrunken (limma) significant counts ---\n")
+for (j in seq_len(ncol(bhat))) {
+  ct_name   <- colnames(bhat)[j]
+  limma_res <- topTable(fit2, coef = ct_name, number = Inf, sort.by = "none")
+  n_limma   <- sum(limma_res$adj.P.Val < 0.05)
+  n_mash    <- n_sig_mash[ct_name]
+  cat(sprintf("  %-20s: unshrunken = %5d, shrunken = %5d (ratio: %.2f)\n",
+              ct_name, n_limma, n_mash, n_mash / max(n_limma, 1)))
+}
+```
+
+## 6.7 Effect Sharing Across Cell Types
+
+```{r mashr-sharing}
+n_sig_total <- length(get_significant_results(m, thresh = 0.05))
+cat(sprintf("Total genes significant in >=1 cell type (lfsr < 0.05): %d.\n", n_sig_total))
+
+if (n_sig_total >= 2) {
+  sharing      <- get_pairwise_sharing(m, factor = 0.5, lfsr_thresh = 0.05)
+  sharing_sign <- get_pairwise_sharing(m, factor = 0,   lfsr_thresh = 0.05)
+  cat("Computed pairwise effect sharing (same sign & within 2-fold magnitude):\n")
+  print(round(sharing, 2))
+} else {
+  sharing      <- NULL
+  sharing_sign <- NULL
+  cat("Too few significant genes for sharing analysis.\n")
+}
+```
+
+## 6.8 Visualizations
+
+```{r mashr-sharing-plot, fig.width=8, fig.height=7}
+if (!is.null(sharing)) {
+  ct_order <- c("LAE", "AT2", "FB", "MV")
+
+  sharing_clean <- sharing
+  rownames(sharing_clean) <- gsub("Smg1i_in_", "", rownames(sharing_clean))
+  colnames(sharing_clean) <- gsub("Smg1i_in_", "", colnames(sharing_clean))
+
+  sharing_df <- melt(sharing_clean)
+  colnames(sharing_df) <- c("CellType1", "CellType2", "Sharing")
+  sharing_df$CellType1 <- factor(sharing_df$CellType1, levels = ct_order)
+  sharing_df$CellType2 <- factor(sharing_df$CellType2, levels = ct_order)
+
+  p_share <- ggplot(sharing_df, aes(x = CellType1, y = CellType2, fill = Sharing)) +
+    geom_tile(color = "white", linewidth = 0.8) +
+    geom_text(aes(label = round(Sharing, 2)),
+              size = 4, fontface = "bold",
+              color = ifelse(sharing_df$Sharing > 0.6, "white", "grey20")) +
+    scale_fill_gradient(low = "white", high = "#185FA5",
+                        limits = c(0, 1), name = "Sharing") +
+    labs(title    = "Pairwise Effect Sharing",
+         subtitle = "Same sign & within 2-fold magnitude (lfsr < 0.05)",
+         x = NULL, y = NULL) +
+    theme_minimal(base_size = 13) +
+    theme(axis.text.x   = element_text(angle = 45, hjust = 1, face = "bold"),
+          axis.text.y   = element_text(face = "bold"),
+          panel.grid    = element_blank(),
+          plot.title    = element_text(face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(color = "grey40", hjust = 0.5))
+
+  ggsave(file.path(OUT_DIR_FIGURES, paste0("sharing_heatmap_sr_", DATE_STAMP, ".png")),
+         p_share, width = 8, height = 7, dpi = 300, bg = "white")
+  print(p_share)
+}
+```
+
+```{r logfc-cor-heatmap, fig.width=8, fig.height=7}
+CT_ORDER <- c("LAE", "AT2", "FB", "MV")
+
+nmd_mask <- (pm > 0) & (lfsr < 0.05)
+nmd_any  <- rowSums(nmd_mask) >= 1
+cat(sprintf("FILTER: subsetting to NMD susceptible genes (posterior mean > 0 & lfsr < 0.05 in >=1 cell type).\n  Genes before: %d / NMD susceptible: %d.\n",
+            nrow(pm), sum(nmd_any)))
+
+stopifnot("Need at least 2 NMD susceptible genes" = sum(nmd_any) >= 2)
+
+drop_col <- grep("LAE_ALI", colnames(pm), value = TRUE)
+pm_nmd   <- pm[nmd_any, !colnames(pm) %in% drop_col]
+
+cor_pearson <- cor(pm_nmd, method = "pearson")
+rownames(cor_pearson) <- gsub("Smg1i_in_", "", rownames(cor_pearson))
+colnames(cor_pearson) <- gsub("Smg1i_in_", "", colnames(cor_pearson))
+
+cor_df <- melt(cor_pearson)
+colnames(cor_df) <- c("CellType1", "CellType2", "Correlation")
+cor_df$CellType1 <- factor(cor_df$CellType1, levels = CT_ORDER)
+cor_df$CellType2 <- factor(cor_df$CellType2, levels = CT_ORDER)
+
+p_cor <- ggplot(cor_df, aes(x = CellType1, y = CellType2, fill = Correlation)) +
+  geom_tile(color = "white", linewidth = 0.8) +
+  geom_text(aes(label = round(Correlation, 2)),
+            size = 4, fontface = "bold",
+            color = ifelse(cor_df$Correlation > 0.6, "white", "grey20")) +
+  scale_fill_gradient2(low = "#D73027", mid = "white", high = "#185FA5",
+                       midpoint = 0, limits = c(-1, 1), name = "Pearson r") +
+  labs(title    = "logFC Correlation: NMD-Responsive Genes",
+       subtitle = "Pearson r of posterior mean logFC across cell type pairs",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x   = element_text(angle = 45, hjust = 1, face = "bold"),
+        axis.text.y   = element_text(face = "bold"),
+        panel.grid    = element_blank(),
+        plot.title    = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(color = "grey40", hjust = 0.5))
+
+ggsave(file.path(OUT_DIR_FIGURES, paste0("logfc_cor_heatmap_sr_", DATE_STAMP, ".png")),
+       p_cor, width = 8, height = 7, dpi = 300, bg = "white")
+
+print(p_cor)
+```
+
+## 6.9 Save Results
+
+```{r mashr-save}
+OUT_DIR_MASH    <- "/udd/reyle/nmd_lungcells_2026/shortread_dge/mashr"
+DATE_STAMP_MASH <- "2026.3.10"
+dir.create(OUT_DIR_MASH, recursive = TRUE, showWarnings = FALSE)
+
+saveRDS(m, file = file.path(OUT_DIR_MASH, paste0("mashr_model_", DATE_STAMP_MASH, ".rds")))
+
+gene_anno <- dge$genes[, c("ensembl_gene_id_version", "external_gene_name")]
+gene_anno <- gene_anno[!duplicated(gene_anno$ensembl_gene_id_version), ]
+
+pm_df <- as.data.frame(pm)
+pm_df$gene_id <- rownames(pm)
+pm_df <- merge(pm_df, gene_anno,
+               by.x = "gene_id", by.y = "ensembl_gene_id_version", all.x = TRUE)
+pm_df <- pm_df[, c("gene_id", "external_gene_name", colnames(pm))]
+pm_df <- pm_df[order(pm_df$gene_id), ]
+fwrite(pm_df, file.path(OUT_DIR_MASH, paste0("mashr_posterior_means_", DATE_STAMP_MASH, ".csv")))
+
+lfsr_df <- as.data.frame(lfsr)
+lfsr_df$gene_id <- rownames(lfsr)
+lfsr_df <- merge(lfsr_df, gene_anno,
+                 by.x = "gene_id", by.y = "ensembl_gene_id_version", all.x = TRUE)
+lfsr_df <- lfsr_df[, c("gene_id", "external_gene_name", colnames(lfsr))]
+lfsr_df <- lfsr_df[order(lfsr_df$gene_id), ]
+fwrite(lfsr_df, file.path(OUT_DIR_MASH, paste0("mashr_lfsr_", DATE_STAMP_MASH, ".csv")))
+
+if (!is.null(sharing)) {
+  fwrite(as.data.frame(sharing),
+         file.path(OUT_DIR_MASH, paste0("mashr_sharing_2fold_", DATE_STAMP_MASH, ".csv")),
+         row.names = TRUE)
+  fwrite(as.data.frame(sharing_sign),
+         file.path(OUT_DIR_MASH, paste0("mashr_sharing_sign_", DATE_STAMP_MASH, ".csv")),
+         row.names = TRUE)
+}
+fwrite(as.data.frame(Vhat),
+       file.path(OUT_DIR_MASH, paste0("mashr_null_correlation_", DATE_STAMP_MASH, ".csv")),
+       row.names = TRUE)
+
+for (j in seq_len(ncol(pm))) {
+  ct_name <- colnames(pm)[j]
+  res <- data.frame(
+    ensembl_gene_id_version = rownames(pm),
+    logFC                   = pm[, j],
+    adj.P.Val               = lfsr[, j],
+    nmd_responsive          = pm[, j] > 0 & lfsr[, j] < 0.05,
+    stringsAsFactors        = FALSE
+  )
+  res <- merge(res, gene_anno,
+               by.x = "ensembl_gene_id_version",
+               by.y = "ensembl_gene_id_version", all.x = TRUE)
+  colnames(res)[colnames(res) == "external_gene_name"] <- "hgnc_symbol"
+  res <- res[order(res$adj.P.Val), ]
+
+  ct_code <- tolower(gsub("Smg1i_in_", "", ct_name))
+  ct_code <- gsub("_", "", ct_code)
+
+  fwrite(res, file.path(OUT_DIR_MASH,
+                        paste0("nmd_mashr_dge_", ct_code, "_", DATE_STAMP_MASH, ".csv")))
+}
+
+cat(sprintf("Saved mashr outputs to %s: model RDS, posterior means, lfsr, sharing, null correlation,\n  and %d per-cell-type CSVs.\n",
+            OUT_DIR_MASH, ncol(pm)))
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

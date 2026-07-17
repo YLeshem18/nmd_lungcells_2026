@@ -1,0 +1,453 @@
+---
+title: "Short-Read Gene Vs Long-Read Isoform: NMD Response Comparison"
+author: "Leshem, Yul"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: lumen
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, dev = "png")
+options(bitmapType = "cairo")
+
+```
+
+# Overview
+
+Two-pipeline comparison of NMD susceptible gene calls across the four kept
+cell types (AT2, LAE, FB, MV), restricted to short-read gene-level DGE and
+long-read isoform-level DIE. The long-read gene-level DGE pipeline is
+intentionally excluded here.
+
+For long-read isoforms we need a single per-gene logFC summary. We use a
+significance-weighted mean of isoform-level posterior means, with weights
+`-log10(lfsr)` clipped at the analysis threshold so that only confidently
+called isoforms contribute. A gene is considered NMD susceptible in a cell
+type if **any** of its isoforms is significant with positive logFC.
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(ggplot2)
+  library(patchwork)
+  library(scales)
+})
+
+# Bioconductor namespace masking guard
+select <- dplyr::select
+filter <- dplyr::filter
+rename <- dplyr::rename
+count  <- dplyr::count
+slice  <- dplyr::slice
+first  <- dplyr::first
+```
+
+# Configuration
+
+```{r config}
+BASE       <- "/udd/reyle/nmd_lungcells_2026"
+OUTPUT_DIR <- file.path(BASE, "final_figures/comparison")
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# Source directories for the two mashr result sets
+SR_DGE_DIR <- file.path(BASE, "shortread_dge/mashr")
+DIE_DIR    <- file.path(BASE, "long_read/mashr")
+
+SR_PATTERN  <- "^nmd_mashr_dge_.*_2026\\.3\\.10\\.csv$"
+DIE_PATTERN <- "^nmd_mashr_die_.*_2026\\.3\\.10\\.csv$"
+
+# Four cell types — DD_ALI and DO_ALI are cut from the paper.
+CT_KEEP  <- c("AT2", "LAE", "FB", "MV")
+CT_ORDER <- CT_KEEP
+
+# Cell-type code (lowercase, from filename) -> display name.
+# Pipeline writes nmd_mashr_*_at2/lae/fb/mv, so the keys are at2/lae/fb/mv.
+CELLTYPE_MAP <- c("at2" = "AT2", "lae" = "LAE", "fb" = "FB", "mv" = "MV")
+
+LFSR_THRESH <- 0.05
+LOGFC_THRESH <- 0
+
+```
+
+# Load mashr Results
+
+```{r load-results}
+# Helper: read one per-cell-type result CSV and tag with display CT name
+read_results <- function(path, ct_extractor, id_candidates) {
+  ct_code <- ct_extractor(basename(path))
+  ct_name <- CELLTYPE_MAP[ct_code]
+  if (is.na(ct_name) || !ct_name %in% CT_KEEP) return(NULL)
+
+  df <- fread(path)
+  id_col <- intersect(names(df), id_candidates)
+  if (length(id_col) == 0) id_col <- names(df)[1]
+
+  df %>%
+    rename(.id_col = !!id_col[1]) %>%
+    mutate(ct = ct_name) %>%
+    select(ct, .id_col, logFC, adj.P.Val)
+}
+
+# ---- SR gene-level DGE ----
+sr_files <- list.files(SR_DGE_DIR, pattern = SR_PATTERN, full.names = TRUE)
+cat("FILTER: SR files matching pattern:", length(sr_files), "\n"); print(basename(sr_files))
+sr_dge_all <- lapply(
+  sr_files, read_results,
+  ct_extractor  = function(fn) sub("^nmd_mashr_dge_(.+)_2026.*", "\\1", fn),
+  id_candidates = c("gene_id", "gene", "V1")
+) %>%
+  bind_rows() %>%
+  rename(gene_id = .id_col) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+# ---- LR isoform-level DIE ----
+die_files <- list.files(DIE_DIR, pattern = DIE_PATTERN, full.names = TRUE)
+cat("FILTER: DIE files matching pattern:", length(die_files), "\n"); print(basename(die_files))
+lr_die_all <- lapply(
+  die_files, read_results,
+  ct_extractor  = function(fn) sub("^nmd_mashr_die_(.+)_2026.*", "\\1", fn),
+  id_candidates = c("txid", "isoform", "V1", "gene")
+) %>%
+  bind_rows() %>%
+  rename(txid = .id_col)
+
+stopifnot("No SR rows loaded — check CELLTYPE_MAP vs filenames"  = nrow(sr_dge_all) > 0)
+stopifnot("No LR rows loaded — check CELLTYPE_MAP vs filenames"  = nrow(lr_die_all) > 0)
+
+cat("SR DGE rows:", nrow(sr_dge_all), "\n")
+cat("LR DIE rows:", nrow(lr_die_all), "\n")
+cat("\nPer-CT row counts:\n")
+cat("  SR DGE: "); print(table(sr_dge_all$ct))
+cat("  LR DIE: "); print(table(lr_die_all$ct))
+```
+
+# Build Transcript → Gene Mapping
+
+The LR isoform results are keyed by txid. For both the logFC aggregation
+and the gene-level sharing analysis, we need a txid → gene_id link. Source
+is the project gmap RDS, with a fallback to the long-read DGEList.
+
+```{r load-iso-to-gene}
+GMAP_PATH        <- "/udd/repjc/RESEARCH/REUSABLE_CODE/rds/gmap_txlevel_ENSGv115_2025.08.12.rds"
+DGELIST_ISO_PATH <- file.path(BASE, "long_read/dge_isoform_longread_2026.3.3.rds")
+
+if (file.exists(GMAP_PATH)) {
+  gmap <- readRDS(GMAP_PATH)
+  tx_col_candidates <- c("ensembl_transcript_id_version",
+                         "ensembl_transcript_id",
+                         "transcript_id_version",
+                         "transcript_id", "txid")
+  tx_col <- intersect(tx_col_candidates, colnames(gmap))[1]
+  if (is.na(tx_col)) stop("No transcript-ID column found in gmap")
+
+  iso_to_gene <- unique(data.frame(
+    txid        = gmap[[tx_col]],
+    gene_id     = gmap$ensembl_gene_id_version,
+    hgnc_symbol = gmap$hgnc_symbol,
+    stringsAsFactors = FALSE
+  ))
+  cat("iso_to_gene from gmap:", nrow(iso_to_gene), "rows\n")
+
+} else if (file.exists(DGELIST_ISO_PATH)) {
+  dge_iso <- readRDS(DGELIST_ISO_PATH)
+  iso_to_gene <- unique(dge_iso$genes[, c("txid", "gene_id", "hgnc_symbol")])
+  cat("iso_to_gene from long-read DGEList:", nrow(iso_to_gene), "rows\n")
+
+} else {
+  stop("Neither gmap RDS nor long-read DGEList found — cannot build iso_to_gene")
+}
+
+iso_to_gene <- iso_to_gene %>%
+  filter(!is.na(gene_id), gene_id != "") %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
+  distinct(txid, .keep_all = TRUE)
+
+cat("After cleanup:", nrow(iso_to_gene), "rows\n")
+
+```
+
+# Aggregate LR Isoform logFC To Gene Level
+
+For each gene in each cell type, compute a significance-weighted mean
+isoform logFC:
+
+$$
+\bar{\beta}_{g,c} = \frac{\sum_{i \in g} w_{i,c} \, \beta_{i,c}}{\sum_{i \in g} w_{i,c}}, \quad
+w_{i,c} = \max\!\left(-\log_{10}(\text{lfsr}_{i,c}),\, \epsilon\right)
+$$
+
+The floor $\epsilon$ on the weight prevents non-significant isoforms from
+contributing zero weight (which would crash the divide). It's set to a
+small positive value so high-significance isoforms still dominate.
+
+```{r aggregate-lr-iso-to-gene}
+EPS <- 1e-3  # weight floor
+
+n_before <- nrow(lr_die_all)
+lr_iso_with_gene <- lr_die_all %>%
+  inner_join(iso_to_gene %>% select(txid, gene_id_clean),
+             by = "txid") %>%
+  mutate(weight = pmax(-log10(adj.P.Val), EPS))
+cat(sprintf("FILTER: isoforms joined to a gene_id.\n  Rows before: %d / after join: %d (dropped %d unmapped).\n",
+            n_before, nrow(lr_iso_with_gene), n_before - nrow(lr_iso_with_gene)))
+
+lr_iso_gene <- lr_iso_with_gene %>%
+  group_by(ct, gene_id_clean) %>%
+  summarise(logFC      = sum(weight * logFC) / sum(weight),
+            min_lfsr   = min(adj.P.Val, na.rm = TRUE),
+            n_isoforms = n(),
+            .groups = "drop")
+
+cat("Per-cell-type gene counts after aggregation:\n")
+print(table(lr_iso_gene$ct))
+```
+
+# Combined Long-Format Table For Plotting
+
+```{r build-long-format}
+sr_long <- sr_dge_all %>%
+  mutate(analysis = "Short-Read Gene") %>%
+  select(analysis, ct, gene_id_clean, logFC, lfsr = adj.P.Val)
+
+lr_long <- lr_iso_gene %>%
+  mutate(analysis = "Long-Read Isoform") %>%
+  select(analysis, ct, gene_id_clean, logFC, lfsr = min_lfsr)
+
+combined <- bind_rows(sr_long, lr_long) %>%
+  mutate(analysis = factor(analysis,
+                           levels = c("Short-Read Gene", "Long-Read Isoform")),
+         ct       = factor(ct, levels = CT_ORDER),
+         is_sig   = lfsr < LFSR_THRESH,
+         is_nmd   = is_sig & logFC > LOGFC_THRESH)
+
+cat("Combined table:", nrow(combined), "rows\n")
+cat("\nNMD susceptible counts (lfsr <", LFSR_THRESH, "& logFC >", LOGFC_THRESH, "):\n")
+combined %>%
+  group_by(analysis, ct) %>%
+  summarise(n_total = n(),
+            n_nmd   = sum(is_nmd, na.rm = TRUE),
+            .groups = "drop") %>%
+  print()
+
+```
+
+# logFC Distribution Of NMD Susceptible Genes
+
+Boxplots of posterior-mean logFC restricted to NMD susceptible genes
+(lfsr < 0.05 & logFC > 0), faceted by cell type, dodged by analysis.
+
+```{r logfc-distribution, fig.width=10, fig.height=6}
+nmd_only <- combined %>% filter(is_nmd)
+
+# Median logFC per (analysis, ct) for the dashed reference line
+median_logfc <- nmd_only %>%
+  group_by(analysis, ct) %>%
+  summarise(median_logFC = median(logFC), .groups = "drop")
+overall_median <- median(nmd_only$logFC)
+
+p_logfc <- ggplot(nmd_only, aes(x = ct, y = logFC, fill = analysis)) +
+  geom_boxplot(alpha = 0.85, outlier.size = 0.4, outlier.alpha = 0.4,
+               position = position_dodge(width = 0.75), width = 0.7) +
+  geom_hline(yintercept = overall_median, linetype = "dashed",
+             color = "grey40", linewidth = 0.4) +
+  scale_fill_manual(values = c("Short-Read Gene"   = "#7B8DC9",
+                               "Long-Read Isoform" = "#7BB07B")) +
+  labs(
+    title    = "logFC Distribution Of NMD Susceptible Genes",
+    subtitle = "lfsr < 0.05 & logFC > 0 | dashed line: overall median",
+    x        = "Cell Type",
+    y        = "Posterior Mean logFC (Smg1i Vs DMSO)",
+    fill     = "Analysis"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title      = element_text(face = "bold"),
+        plot.subtitle   = element_text(color = "grey40"),
+        legend.position = "top",
+        panel.grid.minor = element_blank())
+
+print(p_logfc)
+
+ggsave(file.path(OUTPUT_DIR, "logfc_distribution_sr_vs_lriso.png"),
+       p_logfc, width = 10, height = 6, dpi = 300, bg = "white")
+```
+
+```{r logfc-summary-stats}
+cat("Summary statistics (NMD susceptible genes only):\n")
+nmd_only %>%
+  group_by(analysis, ct) %>%
+  summarise(n      = n(),
+            min    = round(min(logFC), 3),
+            Q1     = round(quantile(logFC, 0.25), 3),
+            median = round(median(logFC), 3),
+            mean   = round(mean(logFC), 3),
+            Q3     = round(quantile(logFC, 0.75), 3),
+            max    = round(max(logFC), 3),
+            .groups = "drop") %>%
+  print()
+
+```
+
+# Shared Vs Cell-Type-Specific NMD Features
+
+For each pipeline, count features (genes for SR, isoforms for LR) at their
+native resolution — no cross-pipeline aggregation. A feature is NMD susceptible
+in cell type X if its own lfsr < 0.05 and logFC > 0 in X. Sharing tier =
+number of cell types where the same feature ID crosses both thresholds.
+
+```{r build-sharing-table}
+# ---- SR side: features = genes ----
+sr_features <- sr_dge_all %>%
+  mutate(ct     = factor(ct, levels = CT_ORDER),
+         is_sig = adj.P.Val < LFSR_THRESH,
+         is_nmd = is_sig & logFC > LOGFC_THRESH) %>%
+  filter(is_nmd) %>%
+  transmute(analysis  = "Short-Read Gene",
+            ct,
+            feature_id = gene_id_clean)
+
+# ---- LR side: features = isoforms (no gene aggregation) ----
+lr_features <- lr_die_all %>%
+  mutate(ct     = factor(ct, levels = CT_ORDER),
+         is_sig = adj.P.Val < LFSR_THRESH,
+         is_nmd = is_sig & logFC > LOGFC_THRESH) %>%
+  filter(is_nmd) %>%
+  transmute(analysis  = "Long-Read Isoform",
+            ct,
+            feature_id = txid)
+
+features_long <- bind_rows(sr_features, lr_features) %>%
+  mutate(analysis = factor(analysis,
+                           levels = c("Short-Read Gene", "Long-Read Isoform")))
+
+# Per-feature sharing count (within an analysis, # CTs the feature appears in)
+sharing_counts <- features_long %>%
+  group_by(analysis, feature_id) %>%
+  summarise(n_cts = n_distinct(ct), .groups = "drop")
+
+# Join back so each (analysis, ct, feature_id) row gets its sharing bin
+sharing_long <- features_long %>%
+  inner_join(sharing_counts, by = c("analysis", "feature_id")) %>%
+  mutate(sharing_bin = factor(as.character(n_cts),
+                              levels = as.character(seq_len(length(CT_KEEP)))))
+
+# Per-CT, per-tier counts
+sharing_summary <- sharing_long %>%
+  group_by(analysis, ct, sharing_bin) %>%
+  summarise(n_features = n(), .groups = "drop") %>%
+  group_by(analysis, ct) %>%
+  mutate(n_total      = sum(n_features),
+         n_specific   = ifelse(sharing_bin == "1", n_features, 0),
+         pct_specific = round(100 * sum(n_specific) / n_total, 1)) %>%
+  ungroup()
+
+totals <- sharing_summary %>%
+  distinct(analysis, ct, n_total, pct_specific)
+
+cat("Sharing tier definitions: sharing_bin = number of cell types a feature is",
+    "NMD susceptible in (1 = cell-type-specific, 4 = all).\n")
+cat("Per-CT totals and % CT-specific:\n")
+print(totals)
+
+cat("\nUnique feature counts per analysis (each feature counted once):\n")
+features_long %>%
+  group_by(analysis) %>%
+  summarise(n_unique_features = n_distinct(feature_id), .groups = "drop") %>%
+  print()
+```
+
+```{r sharing-plot, fig.width=11, fig.height=6}
+# Color gradient: warm for unique (1 CT), deep for shared in all 4
+fill_palette <- c("1" = "#D6604D",  # 1 CT — unique (warmest)
+                  "2" = "#92C5DE",  # 2 CTs
+                  "3" = "#4393C3",  # 3 CTs
+                  "4" = "#2166AC")  # all 4 CTs (deepest)
+
+p_sharing <- ggplot(sharing_summary,
+                    aes(x = ct, y = n_features, fill = sharing_bin)) +
+  geom_col(alpha = 0.9, width = 0.7) +
+  geom_text(data = totals,
+            aes(x = ct, y = n_total,
+                label = paste0(comma(n_total), "\n(", pct_specific, "% specific)"),
+                fill = NULL),
+            vjust = -0.2, size = 3.2, lineheight = 0.9) +
+  facet_wrap(~ analysis, ncol = 2, scales = "free_y") +
+  scale_fill_manual(values = fill_palette,
+                    name = "Shared In # Cell Types",
+                    labels = c("1" = "1 (unique)",
+                               "2" = "2",
+                               "3" = "3",
+                               "4" = "4 (all)")) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.18))) +
+  labs(title    = "Shared Vs Cell-Type-Specific NMD Features Per Analysis",
+       subtitle = "lfsr < 0.05 & logFC > 0 | SR features = genes, LR features = isoforms (native resolution)",
+       x = "Cell Type", y = "Number Of NMD Susceptible Features") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title         = element_text(face = "bold"),
+        plot.subtitle      = element_text(color = "grey40"),
+        strip.text         = element_text(face = "bold", size = 12),
+        legend.position    = "top",
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor   = element_blank())
+
+print(p_sharing)
+
+ggsave(file.path(OUTPUT_DIR, "sharing_sr_genes_vs_lr_isoforms.png"),
+       p_sharing, width = 11, height = 6, dpi = 300, bg = "white")
+
+```
+
+```{r sharing-stats}
+cat("Sharing-tier feature counts per analysis (each feature counted once per CT it appears in):\n")
+sharing_summary %>%
+  group_by(analysis, sharing_bin) %>%
+  summarise(n_feat_x_ct = sum(n_features), .groups = "drop") %>%
+  pivot_wider(names_from = sharing_bin, values_from = n_feat_x_ct,
+              names_prefix = "tier_") %>%
+  print()
+
+cat("\nUnique-feature counts per tier (each feature_id counted once):\n")
+sharing_counts %>%
+  count(analysis, n_cts, name = "n_features") %>%
+  pivot_wider(names_from = n_cts, values_from = n_features,
+              names_prefix = "tier_") %>%
+  print()
+```
+
+# Save Results
+
+```{r save-results}
+# logFC distributions of NMD susceptible genes (gene-level, both pipelines)
+fwrite(nmd_only,
+       file.path(OUTPUT_DIR, "logfc_nmd_responsive_sr_vs_lriso.csv"))
+
+# Feature-resolution sharing breakdown (SR genes vs LR isoforms)
+fwrite(sharing_summary,
+       file.path(OUTPUT_DIR, "sharing_summary_sr_genes_vs_lr_isoforms.csv"))
+
+# Per-feature sharing counts (one row per analysis × feature_id)
+fwrite(sharing_counts,
+       file.path(OUTPUT_DIR, "sharing_counts_per_feature.csv"))
+
+# LR isoform-to-gene aggregation (kept as audit table for the logFC panel)
+fwrite(lr_iso_gene,
+       file.path(OUTPUT_DIR, "lr_iso_aggregated_to_gene.csv"))
+
+cat("All saved to:", OUTPUT_DIR, "\n")
+print(list.files(OUTPUT_DIR, pattern = "sr_genes_vs|sr_vs_lriso|lr_iso"))
+
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
