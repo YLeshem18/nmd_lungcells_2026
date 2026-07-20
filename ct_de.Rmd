@@ -12,7 +12,7 @@ output:
     df_print: paged
     theme: flatly
 ---
-Code location: `/udd/reyle/nmd_lungcells_2026/code/ct_de.Rmd`
+Code location: `/udd/reyle/nmd_lungcells_2026/code/final/ct_de.Rmd`
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,

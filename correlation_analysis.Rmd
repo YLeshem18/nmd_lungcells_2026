@@ -11,7 +11,7 @@ output:
     number_sections: true
 ---
 
-Code location: `/udd/reyle/nmd_lungcells_2026/code/NMD_correlation_analysis.Rmd`
+Code location: `/udd/reyle/nmd_lungcells_2026/code/final/correlation_analysis.Rmd`
 
 # Overview
 

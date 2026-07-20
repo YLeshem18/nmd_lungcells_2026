@@ -18,6 +18,8 @@ options(bitmapType = "cairo")
 
 ```
 
+Code location: `/udd/reyle/nmd_lungcells_2026/code/final/comparison_analysis.Rmd`
+
 # Overview
 
 Two-pipeline comparison of NMD susceptible gene calls across the four kept
