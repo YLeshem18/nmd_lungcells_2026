@@ -1,0 +1,178 @@
+---
+title: "NMD-target genes are enriched for RNA-binding proteins"
+subtitle: "Long-read DIE isoform results (mashr NMD calls) intersected with the Gerstberger 2014 RBP census"
+author: "Yul Leshem"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document: { toc: true, toc_float: true, df_print: paged, code_folding: hide, number_sections: true }
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE, fig.width=10, fig.height=5, dpi=110)
+options(bitmapType="cairo"); .libPaths(c("/udd/reyle/Rlibs", .libPaths()))
+```
+
+```{r libs}
+suppressPackageStartupMessages({
+  library(data.table); library(dplyr); library(tidyr); library(tibble)
+  library(ggplot2); library(knitr); library(readxl)
+})
+select <- dplyr::select; filter <- dplyr::filter; rename <- dplyr::rename
+count  <- dplyr::count;  slice  <- dplyr::slice
+```
+
+# Overview
+
+Self-contained analysis: load the **long-read differential-isoform-expression (DIE) results**
+(mashr per-cell-type isoform posterior means + lfsr), define **NMD-target genes** (any gene with
+a confident NMD isoform), and test whether they are enriched for **RNA-binding proteins** using
+the **Gerstberger, Hafner & Tuschl 2014** census of 1,542 human RBPs.
+
+- "NMD isoform" = `lfsr < 0.05 & posterior mean > 0` in a cell type (NMD up-call).
+- "NMD-target gene" = a gene with ≥1 NMD isoform in ≥1 cell type.
+- Background = all genes with an isoform tested in the DIE/mashr set.
+
+```{r params}
+proj    <- "/udd/reyle/nmd_lungcells_2026"
+OUT_DIR <- file.path(proj, "long_read/nmd_rbp_enrichment")
+dir.create(OUT_DIR, recursive=TRUE, showWarnings=FALSE)
+DATE_STAMP   <- format(Sys.Date(), "%Y.%m.%d")
+CELL_TYPES   <- c("AT","DD","FB","MV")
+LFSR_NMD_THR <- 0.05
+
+# long-read isoform DGEList (for the isoform -> gene/symbol mapping)
+DGE_ISO_PATH  <- file.path(proj, "short_read/dge_isoform_longread_filtered_2026.3.3.rds")
+# long-read DIE isoform mashr results
+PM_ISO_PATH   <- file.path(proj, "long_read/mashr/mashr_isoform_posterior_means_2026.3.10.csv")
+LFSR_ISO_PATH <- file.path(proj, "long_read/mashr/mashr_isoform_lfsr_2026.3.10.csv")
+# Gerstberger 2014 RBP census (Supplementary Table S3). Either the xls or the exported csv.
+RBP_XLS <- file.path(proj, "41576_2014_BFnrg3813_MOESM25_ESM.xls")   # <- transfer this here
+RBP_CSV <- file.path(proj, "gerstberger_2014_rbp_census.csv")        # <- or this (if you exported it)
+```
+
+# Load long-read DIE isoform results
+
+```{r load}
+dge_iso  <- readRDS(DGE_ISO_PATH)
+pm_iso   <- read.csv(PM_ISO_PATH,   check.names=FALSE, stringsAsFactors=FALSE)
+lfsr_iso <- read.csv(LFSR_ISO_PATH, check.names=FALSE, stringsAsFactors=FALSE)
+colnames(pm_iso)[1] <- "isoform_id"; colnames(lfsr_iso)[1] <- "isoform_id"
+
+# isoform -> gene / symbol map from the DGEList
+iso_col  <- intersect(c("isoform_id","isoform","txid","transcript_id"), colnames(dge_iso$genes))[1]
+gene_col <- intersect(c("gene_id","associated_gene","ensembl_gene_id","gene_id_ens115_sqanti"), colnames(dge_iso$genes))[1]
+sym_col  <- intersect(c("hgnc_symbol","gene_name","external_gene_name","symbol"), colnames(dge_iso$genes))[1]
+iso2gene <- data.frame(isoform_id=dge_iso$genes[[iso_col]], gene_id=dge_iso$genes[[gene_col]],
+                       hgnc_symbol=dge_iso$genes[[sym_col]], stringsAsFactors=FALSE)
+
+resolve_mash_col <- function(df, ct){ cn<-colnames(df); if (ct %in% cn) return(ct)
+  h<-cn[grepl(paste0("_in_",ct,"$"),cn)]; if(length(h)==1) return(h)
+  h<-cn[grepl(paste0("^",ct,"[._:-]"),cn)]; if(length(h)==1) return(h); stop("no mash col ",ct) }
+
+cat(sprintf("DIE isoforms loaded: %d; mapped to %d genes\n",
+            nrow(lfsr_iso), length(unique(iso2gene$gene_id))))
+```
+
+# Load Gerstberger 2014 RBP census
+
+```{r load-rbp}
+sv <- function(x) sub("\\..*$","",x)   # strip Ensembl version
+if (file.exists(RBP_CSV)) {
+  rbp <- fread(RBP_CSV)                                   # gene_symbol, ensembl_gene_id, consensus_rna_target, domains
+} else {
+  rr  <- read_excel(RBP_XLS, sheet="RBP table")
+  rbp <- data.frame(gene_symbol          = rr[["gene name"]],
+                    ensembl_gene_id      = rr[["gene id"]],
+                    consensus_rna_target = rr[["consensus RNA target"]],
+                    stringsAsFactors=FALSE)
+}
+rbp_ens   <- unique(sv(rbp$ensembl_gene_id))
+rbp_sym   <- unique(rbp$gene_symbol)
+sr_family <- paste0("SRSF", 1:12)   # canonical 12 human SR proteins (Manley & Krainer 2010)
+
+cat(sprintf("RBP census: %d RBPs (%d with Ensembl IDs)\n", length(rbp_sym), length(rbp_ens)))
+```
+
+# NMD-target genes from the DIE results
+
+```{r nmd-genes}
+nmd_gene_ct <- bind_rows(lapply(CELL_TYPES, function(ct){
+  l <- lfsr_iso[[resolve_mash_col(lfsr_iso, ct)]]; p <- pm_iso[[resolve_mash_col(pm_iso, ct)]]
+  iso <- lfsr_iso$isoform_id[!is.na(l) & !is.na(p) & l < LFSR_NMD_THR & p > 0]
+  data.frame(ct=ct, gene_id=unique(iso2gene$gene_id[iso2gene$isoform_id %in% iso]))
+}))
+nmd_genes <- unique(nmd_gene_ct$gene_id)
+bg_genes  <- unique(iso2gene$gene_id[iso2gene$isoform_id %in% lfsr_iso$isoform_id])  # all DIE-tested genes
+
+cat("NMD-target genes per cell type:\n")
+print(nmd_gene_ct %>% count(ct, name="n_nmd_genes"))
+cat(sprintf("\nUnion NMD-target genes (>=1 NMD isoform, any CT): %d of %d tested\n",
+            length(nmd_genes), length(bg_genes)))
+```
+
+# RBP enrichment among NMD-target genes
+
+```{r rbp-enrichment}
+g2sym  <- iso2gene %>% distinct(gene_id, hgnc_symbol)
+sym_of <- function(gid) g2sym$hgnc_symbol[match(gid, g2sym$gene_id)]
+is_rbp <- function(gid) (sv(gid) %in% rbp_ens) | (sym_of(gid) %in% rbp_sym)
+
+cat(sprintf("NMD-target genes that are RBPs (of 1,542): %d (%.1f%%)\n",
+            sum(is_rbp(nmd_genes)), 100*mean(is_rbp(nmd_genes))))
+
+# enrichment vs all DIE-tested genes (one-sided Fisher)
+tab <- table(NMD_target = bg_genes %in% nmd_genes, RBP = is_rbp(bg_genes))
+print(tab)
+ft <- fisher.test(tab, alternative="greater")
+cat(sprintf("\nRBP enrichment among NMD targets: OR=%.2f (95%% CI %.2f-%.2f), p=%.2e\n",
+            ft$estimate, ft$conf.int[1], ft$conf.int[2], ft$p.value))
+
+kable(data.frame(
+  set            = c("NMD-target genes","background (DIE-tested)"),
+  n_genes        = c(length(nmd_genes), length(bg_genes)),
+  n_RBP          = c(sum(is_rbp(nmd_genes)), sum(is_rbp(bg_genes))),
+  pct_RBP        = round(100*c(mean(is_rbp(nmd_genes)), mean(is_rbp(bg_genes))),1)),
+  caption="RBP fraction among NMD-target genes vs all DIE-tested genes (Gerstberger 2014 census).")
+```
+
+# Per-cell-type RBP enrichment
+
+```{r rbp-enrichment-by-ct}
+kable(bind_rows(lapply(CELL_TYPES, function(ct){
+  gset <- unique(nmd_gene_ct$gene_id[nmd_gene_ct$ct==ct])
+  tb   <- table(NMD = bg_genes %in% gset, RBP = is_rbp(bg_genes))
+  f    <- fisher.test(tb, alternative="greater")
+  data.frame(ct=ct, n_nmd=length(gset), n_rbp=sum(is_rbp(gset)),
+             pct_rbp=round(100*mean(is_rbp(gset)),1),
+             OR=round(f$estimate,2), p=signif(f$p.value,3))
+})), caption="RBP enrichment among NMD-target genes, per cell type.")
+```
+
+# SR proteins (SRSF1-12): which are NMD targets, by cell type
+
+```{r sr-distribution}
+sr_tab <- nmd_gene_ct %>% mutate(sym=sym_of(gene_id)) %>% filter(sym %in% sr_family) %>%
+  distinct(sym, ct) %>% mutate(present=1L) %>%
+  pivot_wider(names_from=ct, values_from=present, values_fill=0) %>%
+  mutate(n_celltypes = rowSums(across(all_of(intersect(CELL_TYPES, colnames(.)))))) %>%
+  arrange(desc(n_celltypes))
+kable(sr_tab, caption="Canonical SR proteins (SRSF1-12) that are NMD targets, by cell type (1 = NMD isoform present).")
+```
+
+# Full list of NMD-target RBPs (supplement)
+
+```{r nmd-rbp-list}
+nmd_rbp <- data.frame(gene_id = nmd_genes[is_rbp(nmd_genes)]) %>%
+  mutate(gene_symbol = sym_of(gene_id),
+         consensus_rna_target = rbp$consensus_rna_target[match(gene_symbol, rbp$gene_symbol)]) %>%
+  arrange(gene_symbol)
+cat(sprintf("NMD-target RBPs: %d\n", nrow(nmd_rbp)))
+print(nmd_rbp %>% count(consensus_rna_target, name="n") %>% arrange(desc(n)))
+fwrite(nmd_rbp, file.path(OUT_DIR, paste0("nmd_target_rbps_", DATE_STAMP, ".csv")))
+fwrite(nmd_gene_ct, file.path(OUT_DIR, paste0("nmd_target_genes_by_ct_", DATE_STAMP, ".csv")))
+cat("Saved to:", OUT_DIR, "\n")
+```
+
+```{r session}
+sessionInfo()
+```
