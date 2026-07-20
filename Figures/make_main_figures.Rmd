@@ -1,0 +1,114 @@
+---
+title: "Main figures — NMD long-read manuscript"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+# Run every chunk from the project root (where nmd_fig_data/ and the make_*.R live).
+knitr::opts_knit$set(root.dir = normalizePath("."))
+```
+
+This document regenerates **Figure 1** and **Figure 2** of the manuscript from the
+data bundle in `nmd_fig_data/`. Each figure is built in two stages: per-panel
+render scripts (R) write PNGs into `fig_panels/`, then a stitching script composes
+the multipanel figure. All panel content and data provenance are noted per figure.
+
+Figures 3–5 (Isopair splice-event attribution and the deep-learning model) are
+produced in separate repositories and are **not** built here.
+
+```{r helpers}
+DATA_DIR <- "nmd_fig_data"
+OUT_DIR  <- "fig_panels"
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+RSCRIPT <- file.path(R.home("bin"), "Rscript")
+PYTHON  <- Sys.which("python"); if (!nzchar(PYTHON)) PYTHON <- Sys.which("python3")
+
+## Run an R script as a subprocess (isolated env, same as the manual pipeline).
+run_r <- function(script, args = character()) {
+  stopifnot(file.exists(script))
+  out <- system2(RSCRIPT, c(shQuote(script), args), stdout = TRUE, stderr = TRUE)
+  cat(paste(utils::tail(out, 12), collapse = "\n"), "\n")
+  st <- attr(out, "status"); if (!is.null(st) && st != 0)
+    stop(sprintf("%s failed (exit %s)", script, st))
+  invisible(out)
+}
+
+## Run a Python stitching script.
+run_py <- function(script) {
+  stopifnot(file.exists(script), nzchar(PYTHON))
+  out <- system2(PYTHON, shQuote(script), stdout = TRUE, stderr = TRUE)
+  cat(paste(utils::tail(out, 8), collapse = "\n"), "\n")
+  st <- attr(out, "status"); if (!is.null(st) && st != 0)
+    stop(sprintf("%s failed (exit %s)", script, st))
+  invisible(out)
+}
+```
+
+# Figure 1 — isoform discovery and the NMD response
+
+Panels (A→F), each a 6×4 in cell composed by `fig_panels/figure_composite.py`:
+
+| Panel | Content | Render script | Data inputs (`nmd_fig_data/`) |
+|-------|---------|---------------|-------------------------------|
+| A | Short-read vs long-read gene-expression correlation | `make_panels.R` | `dge_gene_unfiltered_2026.1.2.rds`, `salmon.merged.gene_counts_length_scaled.rds` |
+| B | Expressed isoforms, shared vs cell-type-specific | `make_panels.R` | `dge_isoform_longread_2026.3.3.rds` |
+| C | Long-read isoform DIE volcano, 4 cell types | `make_panels.R` | `nmd_mashr_die_{at2,dd,fb,mv}_2026.3.10.csv` |
+| D | Posterior-mean logFC distribution, SR gene vs LR isoform | `make_panels.R` | `nmd_mashr_dge_*`, `nmd_mashr_die_*` |
+| E | Pairwise sharing of NMD effects, SR genes vs LR isoforms | `make_panels.R` | mashr CSVs |
+| F | KEGG "protein processing in ER" (hsa04141), LAE | `make_pathway_allct.R` → `make_panels.R` | `nmd_mashr_dge_dd_2026.3.10.csv` |
+
+```{r fig1-panels, results='hide'}
+# Panel F first: render the KEGG pathway PNGs (needs cached hsa04141.xml/.png in fig_panels/)
+run_r("make_pathway_allct.R")
+# Panels A–E + panelF_pathway.png (crops/pads hsa04141.LAE.png)
+run_r("make_panels.R", c(DATA_DIR, OUT_DIR))
+```
+
+```{r fig1-stitch, results='hide'}
+run_py(file.path(OUT_DIR, "figure_composite.py"))
+```
+
+```{r fig1-show, echo=FALSE, out.width='100%'}
+knitr::include_graphics(file.path(OUT_DIR, "figure_composite.png"))
+```
+
+# Figure 2 — productive output response to NMD inhibition
+
+Panel B is the primary "productive output, NMD vs non-NMD genes" panel from
+`make_panelAB.R`. (An alternative two-opposing-programs panel B is available from
+`make_panelB.R` → `panelB_twoprogram.png`; swap it into the stitcher's `TOP["B"]`
+if that layout is preferred.) Panels C–E are worked single-gene examples
+illustrating the three productive-response regimes.
+
+| Panel | Content | Render script | Data inputs |
+|-------|---------|---------------|-------------|
+| A | % transcriptional output lost to NMD (isoform level) | `make_panelAB.R` | `dge_isoform_longread_2026.3.3.rds` |
+| B | Productive output, NMD vs non-NMD genes (NMD-anchored logFC) | `make_panelAB.R` | filtered isoform DGE + `mashr_isoform_{posterior_means,lfsr}_2026.3.10.csv` |
+| C | SHMT2 / MV — ISR induction overrides NMD | `make_gene_examples.R` | filtered isoform DGE + mashr CSVs + `gene_ex/sub.isoforms.gtf` |
+| D | SRSF2 / MV — splicing-factor autoregulation | `make_gene_examples.R` | same |
+| E | PCNA / LAE — transcriptional repression, composition preserved | `make_gene_examples.R` | same |
+
+```{r fig2-panels, results='hide'}
+run_r("make_panelAB.R")       # panelA_outputlost.png, panelB_nmd_vs_nonmd.png
+run_r("make_gene_examples.R") # gene_row_{SHMT2,SRSF2,PCNA}.png
+```
+
+```{r fig2-stitch, results='hide'}
+run_py(file.path(OUT_DIR, "figure_productive_composite.py"))
+```
+
+```{r fig2-show, echo=FALSE, out.width='100%'}
+knitr::include_graphics(file.path(OUT_DIR, "figure_productive_composite.png"))
+```
+
+# Session info
+
+```{r session, echo=FALSE}
+sessionInfo()
+```
