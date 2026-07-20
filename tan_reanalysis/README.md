@@ -12,10 +12,12 @@ Reproduces the manuscript claim:
 
 ## Inputs (not redistributed here)
 
-The four Tan et al. (2025) Supplementary Tables — **S1, S2, S4, S6** (`.xlsx`).
-These are the authors' published data; download them from the paper's supplementary
-material and place them in a directory of your choosing. The eight transcript-level
-DET tables are read per the manifest in `tan_transcript_reanalysis.R`:
+The four Tan et al. (2025) Supplementary Tables — **S1, S2, S4, S6** (`.xlsx`) —
+are bundled here under `tan_reanalysis/data/` (tracked via Git LFS). They are the
+authors' published data, redistributed for reproducibility; please cite Tan et al.
+(2025) and consult the original paper for terms of use. `DATA_DIR` defaults to
+`data`, so run the script from `tan_reanalysis/` (or set `TAN_DATA_DIR`). The eight
+transcript-level DET tables are read per the manifest in `tan_transcript_reanalysis.R`:
 
 | Condition          | File                              | Sheet  |
 |--------------------|-----------------------------------|--------|
